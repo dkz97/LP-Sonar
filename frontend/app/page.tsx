@@ -1,12 +1,13 @@
 "use client";
 
 import { useState } from "react";
-import { BarChart2, MessageSquare, Wallet, Radio, Search } from "lucide-react";
+import { BarChart2, MessageSquare, Wallet, Radio, Search, FlaskConical } from "lucide-react";
 import { FocusPanel } from "@/components/FocusPanel";
 import { HotTable } from "@/components/HotTable";
 import { AlertFeed } from "@/components/AlertFeed";
 import { LPOpportunities } from "@/components/LPOpportunities";
 import { TokenDetailView } from "@/components/TokenDetailView";
+import { LPAnalysis } from "@/components/LPAnalysis";
 import { TokenSnapshot } from "@/lib/api";
 
 const CHAINS = [
@@ -17,7 +18,7 @@ const CHAINS = [
   { label: "ETH", value: "1" },
 ];
 
-type Feature = "lp-monitor" | "token-analyse" | "ai-chat" | "portfolio";
+type Feature = "lp-monitor" | "token-analyse" | "lp-analyse" | "ai-chat" | "portfolio";
 
 export default function Dashboard() {
   const [activeFeature, setActiveFeature] = useState<Feature>("lp-monitor");
@@ -58,8 +59,9 @@ export default function Dashboard() {
       icon: <Search size={14} />,
       available: true,
     },
-    { id: "ai-chat",   label: "AI Chat",   icon: <MessageSquare size={14} />, available: false },
-    { id: "portfolio", label: "Portfolio", icon: <Wallet size={14} />,        available: false },
+    { id: "lp-analyse",  label: "LP 分析",   icon: <FlaskConical size={14} />, available: true },
+    { id: "ai-chat",     label: "AI Chat",   icon: <MessageSquare size={14} />, available: false },
+    { id: "portfolio",   label: "Portfolio", icon: <Wallet size={14} />,        available: false },
   ];
 
   return (
@@ -184,8 +186,12 @@ export default function Dashboard() {
           </span>
         </div>
 
-        {/* Right: search bar (token-analyse) OR chain filter (lp-monitor) */}
-        {activeFeature === "token-analyse" ? (
+        {/* Right: context controls per feature */}
+        {activeFeature === "lp-analyse" ? (
+          <span style={{ fontSize: "12px", color: "var(--text-muted)", fontFamily: "var(--font-mono)" }}>
+            输入 LP 池合约地址 · 按需分析 · 结果缓存 5 分钟
+          </span>
+        ) : activeFeature === "token-analyse" ? (
           <form
             onSubmit={e => { e.preventDefault(); handleSearch(); }}
             style={{ display: "flex", alignItems: "center", gap: "6px", flex: 1, maxWidth: "640px", marginLeft: "auto" }}
@@ -283,7 +289,12 @@ export default function Dashboard() {
       </header>
 
       {/* ── Main content ── */}
-      {activeFeature === "token-analyse" ? (
+      {activeFeature === "lp-analyse" ? (
+        /* LP Analyse — full width, on-demand only */
+        <div style={{ flex: 1, overflowY: "auto", padding: "20px 16px" }}>
+          <LPAnalysis />
+        </div>
+      ) : activeFeature === "token-analyse" ? (
         /* Token Analyse — full width, no sidebar */
         <div style={{ flex: 1, overflowY: "auto", padding: "16px" }}>
           {activeAddress ? (

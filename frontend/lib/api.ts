@@ -101,6 +101,100 @@ export interface LPOpportunity {
   timestamp: number;
 }
 
+// ── Range Recommendation types ─────────────────────────────────────────────────
+
+export type Regime = "range_bound" | "trend_up" | "trend_down" | "chaotic";
+
+// Phase 1 — standard (mature pool) scenario names
+export type ScenarioName = "sideways" | "slow_up" | "slow_down" | "breakout_up" | "breakdown_down";
+
+// Phase 1.5 — launch-mode scenario names (fresh / infant pools)
+export type LaunchScenarioName =
+  | "discovery_sideways"
+  | "grind_up"
+  | "fade_down"
+  | "spike_then_mean_revert"
+  | "pump_and_dump";
+
+export const SCENARIO_LABELS: Record<ScenarioName, string> = {
+  sideways:       "横盘",
+  slow_up:        "缓慢上涨",
+  slow_down:      "缓慢下跌",
+  breakout_up:    "快速突破上涨",
+  breakdown_down: "快速崩盘下跌",
+};
+
+export const LAUNCH_SCENARIO_LABELS: Record<LaunchScenarioName, string> = {
+  discovery_sideways:     "初始震荡",
+  grind_up:               "缓慢积累",
+  fade_down:              "热度消退",
+  spike_then_mean_revert: "拉升后回归",
+  pump_and_dump:          "拉高砸盘",
+};
+
+// Combined label map for all scenario names (use when rendering scenario_pnl dynamically)
+export const ALL_SCENARIO_LABELS: Record<string, string> = {
+  ...SCENARIO_LABELS,
+  ...LAUNCH_SCENARIO_LABELS,
+};
+
+// Phase 1.5 — history tier / evidence adaptive types
+export type HistoryTier = "mature" | "growing" | "fresh" | "infant";
+export type RecommendationMode = "full_replay" | "blended_replay" | "launch_mode" | "observe_only";
+export type Actionability = "standard" | "caution" | "watch_only";
+
+export interface RangeProfile {
+  lower_price: number;
+  upper_price: number;
+  lower_tick: number;
+  upper_tick: number;
+  width_pct: number;       // already in % (e.g. 29.2 means 29.2%)
+  expected_fee_apr: number;   // fraction (e.g. 0.15 = 15% APR)
+  expected_il_cost: number;   // fraction
+  breach_probability: number; // fraction
+  expected_rebalance_frequency: number; // per 7 days
+  expected_net_pnl: number;   // fraction
+  utility_score: number;      // 0–1, raw replay-based score
+  reasons: string[];
+  risk_flags: string[];
+  scenario_pnl: Partial<Record<string, number>>;  // net PnL per scenario (mature or launch)
+  range_type?: string;  // volatility_band | volume_profile | trend_biased | defensive
+  // Phase 1.5 additions (optional; absent for mature pools without young-pool adjustments)
+  shrunk_fee_apr?: number | null;   // fee APR after persistence shrinkage (young pools only)
+  replay_utility?: number | null;   // same as utility_score (replay-based component)
+  scenario_utility?: number | null; // utility computed from scenario PnL simulation
+  final_utility?: number | null;    // blended final utility: w_replay*replay + w_scenario*scenario - penalty
+  young_pool_adjustments?: string[]; // human-readable list of adjustments applied for young pools
+}
+
+export interface RangeRecommendation {
+  is_recommended: boolean;
+  recommendation_confidence: number;
+  regime: Regime;
+  holding_horizon: string;
+  recommended_profile_default: string;
+  profiles: {
+    conservative: RangeProfile | null;
+    balanced: RangeProfile | null;
+    aggressive: RangeProfile | null;
+  };
+  pool_quality_summary: string;
+  no_recommendation_reason: string | null;
+  alternative_ranges: RangeProfile[];
+  timestamp: number;
+  data_freshness: string;
+  // Phase 1.5 additions (all optional with backward-compatible defaults)
+  history_tier?: HistoryTier;               // defaults to "mature" for old responses
+  recommendation_mode?: RecommendationMode; // defaults to "full_replay"
+  actionability?: Actionability;            // defaults to "standard"
+  pool_age_hours?: number;                  // 0.0 if unknown
+  effective_evidence_score?: number;        // 0–1
+  data_quality_score?: number;              // 0–1
+  uncertainty_penalty?: number;             // 0–0.40
+  replay_weight?: number;                   // 0–1
+  scenario_weight?: number;                 // 0–1
+}
+
 // ── Fetch functions ────────────────────────────────────────────────────────────
 
 export async function fetchTokens(
@@ -135,6 +229,23 @@ export async function fetchLPOpportunities(
     next: { revalidate: 0 },
   });
   if (!res.ok) return [];
+  return res.json();
+}
+
+export async function fetchLPRangeRecommendation(
+  poolAddress: string,
+  chain: string
+): Promise<RangeRecommendation> {
+  const res = await fetch(`${API_BASE}/api/v1/lp-range/recommend`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pool_address: poolAddress, chain }),
+    next: { revalidate: 0 },
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status}: ${text}`);
+  }
   return res.json();
 }
 
