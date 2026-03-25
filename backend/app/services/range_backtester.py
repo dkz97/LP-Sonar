@@ -81,6 +81,7 @@ def backtest_candidate(
     horizon_bars: int,
     fee_rate: float,
     tvl_usd: float = 1.0,
+    volume_scale: float = 1.0,
 ) -> BacktestResult:
     """
     Replay a candidate range against the most recent `horizon_bars` of price history.
@@ -92,6 +93,9 @@ def backtest_candidate(
     horizon_bars   Number of bars to replay (e.g. 48 for 48h at 1h resolution).
     fee_rate       Pool fee rate as decimal (e.g. 0.003 for 0.3%).
     tvl_usd        Pool TVL in USD (used only for rebalance cost normalisation).
+    volume_scale   Multiply each bar's volume by this factor before computing fee proxy.
+                   Use to correct token-level OKX volumes to pool-specific fractions.
+                   Default 1.0 (no scaling).
 
     Returns
     -------
@@ -150,8 +154,9 @@ def backtest_candidate(
 
         if in_range:
             in_range_count += 1
-            # Fee proxy: volume × fee_rate × capital_efficiency (per $1 capital)
-            cumulative_fee += volume * fee_rate * cap_eff
+            # Fee proxy: pool-specific volume × fee_rate × capital_efficiency (per $1 capital)
+            # volume_scale corrects token-level OKX bar volumes to pool-specific fraction
+            cumulative_fee += volume * volume_scale * fee_rate * cap_eff
             oor_streak = 0
         else:
             # Breach detection
@@ -210,9 +215,10 @@ def backtest_all_candidates(
     horizon_bars: int,
     fee_rate: float,
     tvl_usd: float = 1.0,
+    volume_scale: float = 1.0,
 ) -> list[BacktestResult]:
     """Run backtest_candidate for all candidates and return results in same order."""
     return [
-        backtest_candidate(ohlcv_bars, c, horizon_bars, fee_rate, tvl_usd)
+        backtest_candidate(ohlcv_bars, c, horizon_bars, fee_rate, tvl_usd, volume_scale)
         for c in candidates
     ]

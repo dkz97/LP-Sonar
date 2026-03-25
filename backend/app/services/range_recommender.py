@@ -415,6 +415,18 @@ async def recommend_range(
     # ── 2. Fetch OHLCV — primary 1H pass ────────────────────────────────
     ohlcv_1h = await _fetch_ohlcv(chain_index, token_address, bar="1H")
 
+    # P2.1.1: pool-specific volume fraction.
+    # OKX candle volumes are token-level (all DEXes). DexScreener volume.h24 is
+    # pool-specific. Scale bar volumes by their ratio so fee proxy reflects actual
+    # fee income for this pool, not the entire DEX ecosystem.
+    # Falls back to 1.0 (no scaling) when < 12 bars are available.
+    volume_fraction = _pool_volume_fraction(pool["volume_24h"], ohlcv_1h)
+    logger.info(
+        "range_recommender: pool=%.8s volume_fraction=%.3f "
+        "(pool_vol_24h=$%.0f)",
+        pool_address, volume_fraction, pool["volume_24h"],
+    )
+
     # Quick first-pass sufficiency assessment to decide whether to fetch finer bars
     sufficiency_1h = assess(
         pool_age_hours=pool_age_hours,
@@ -580,6 +592,7 @@ async def recommend_range(
         horizon_bars=horizon_bars,
         fee_rate=pool["fee_rate"],
         tvl_usd=pool["tvl_usd"],
+        volume_scale=volume_fraction,   # P2.1.1: pool-specific volume correction
     )
 
     weights = scoring_weights or DEFAULT_WEIGHTS
@@ -605,6 +618,7 @@ async def recommend_range(
         fee_rate=pool["fee_rate"],
         tvl_usd=pool["tvl_usd"],
         use_launch_scenarios=use_launch,
+        volume_scale=volume_fraction,   # P2.1.1: pool-specific volume correction
     )
 
     tick_to_scenario: dict[tuple[int, int], dict[str, float]] = {
@@ -745,6 +759,43 @@ async def recommend_range(
 
 
 # ── Utility helpers ─────────────────────────────────────────────────────
+
+def _pool_volume_fraction(pool_vol_24h: float, ohlcv_1h: list[dict]) -> float:
+    """
+    Estimate the fraction of OKX token-level volume attributable to this pool.
+
+    OKX candle volume is aggregated across ALL DEXes trading the token.
+    DexScreener volume.h24 (pool["volume_24h"]) is pool-specific.
+    Their ratio gives the pool's share of on-chain DEX volume for the token.
+
+    Example: SOL/USDC Raydium pool has $50M/day; OKX token-level shows $200M/day
+    → fraction = 0.25 → bar volumes scaled to 25% → realistic fee APR.
+
+    Returns 1.0 (no scaling) when:
+      - DexScreener pool volume is 0 or missing
+      - Fewer than 12 bars available (insufficient for a reliable estimate)
+      - The computed fraction exceeds 1.0 (data timing inconsistency; no inflation)
+
+    Clamps to [0, 1]. Requires at least 12 1H bars.
+    """
+    if pool_vol_24h <= 0:
+        return 1.0
+
+    # Need at least 12 bars to estimate 24h token-level volume reliably
+    if len(ohlcv_1h) < 12:
+        return 1.0
+
+    recent = ohlcv_1h[-24:]   # use up to last 24 bars
+    token_vol_sum = sum(float(b.get("volume", 0)) for b in recent)
+    if token_vol_sum <= 0:
+        return 1.0
+
+    # Pro-rate to 24h if fewer than 24 bars available
+    token_vol_24h_est = token_vol_sum * (24.0 / len(recent))
+
+    fraction = pool_vol_24h / token_vol_24h_est
+    return min(fraction, 1.0)   # clamp: never inflate above token-level
+
 
 def _safe_float(val, default: float = 0.0) -> float:
     try:

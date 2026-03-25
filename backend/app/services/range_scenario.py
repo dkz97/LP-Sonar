@@ -284,6 +284,7 @@ def compute_all_scenario_pnl(
     fee_rate: float,
     tvl_usd: float,
     use_launch_scenarios: bool = False,
+    volume_scale: float = 1.0,
 ) -> list[dict[str, float]]:
     """
     Compute scenario PnL for each candidate in the list.
@@ -294,6 +295,10 @@ def compute_all_scenario_pnl(
     ----------
     use_launch_scenarios  When True, uses LAUNCH_SCENARIO_NAMES instead of
                           SCENARIO_NAMES. Set True for fresh/infant pools.
+    volume_scale          Multiply inferred avg_volume by this factor to convert
+                          token-level OKX volumes to pool-specific levels.
+                          Only applied when avg_volume is derived from bars (not fallback).
+                          Default 1.0 (no scaling).
 
     Returns a list of dicts (same order as candidates).
     """
@@ -301,8 +306,9 @@ def compute_all_scenario_pnl(
 
     recent = ohlcv_bars[-min(horizon_bars, len(ohlcv_bars)):]
     if recent:
-        avg_volume = sum(float(b.get("volume", 0)) for b in recent) / len(recent)
+        avg_volume = (sum(float(b.get("volume", 0)) for b in recent) / len(recent)) * volume_scale
     else:
+        # Young-pool fallback: use TVL proxy; don't apply volume_scale (no OKX data available)
         avg_volume = tvl_usd * 0.05
 
     return [

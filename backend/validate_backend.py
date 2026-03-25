@@ -324,6 +324,69 @@ def test_launch_scenarios() -> None:
         _warn("Launch scenario test skipped (numpy not importable)", str(e))
 
 
+def test_volume_fraction() -> None:
+    section("A9. Pool-Specific Volume Fraction (P2.1.1)")
+    from app.services.range_recommender import _pool_volume_fraction
+    from app.services.range_backtester import backtest_candidate
+    from app.models.schemas import CandidateRange
+
+    # Helper: make uniform bar list
+    def _bars(n: int, vol: float) -> list[dict]:
+        return [{"time": i * 3600, "open": 100.0, "high": 102.0,
+                 "low": 98.0, "close": 100.0, "volume": vol} for i in range(n)]
+
+    # Basic fraction computation
+    bars_24 = _bars(24, vol=10.0)   # token vol = 24*10 = 240/24h
+    frac = _pool_volume_fraction(pool_vol_24h=60.0, ohlcv_1h=bars_24)
+    check(abs(frac - 0.25) < 0.01, "fraction = pool_vol / token_vol (60/240=0.25)",
+          f"got={frac:.4f}")
+
+    # Fraction clamped to 1.0 when pool_vol > token_vol
+    frac_clamped = _pool_volume_fraction(pool_vol_24h=9999.0, ohlcv_1h=bars_24)
+    check(frac_clamped == 1.0, "fraction clamped to 1.0 (pool_vol > token_vol)",
+          f"got={frac_clamped}")
+
+    # Zero pool_vol → 1.0 (no scaling)
+    frac_zero = _pool_volume_fraction(pool_vol_24h=0.0, ohlcv_1h=bars_24)
+    check(frac_zero == 1.0, "pool_vol=0 → fraction=1.0 (no scaling)", f"got={frac_zero}")
+
+    # Too few bars (< 12) → 1.0
+    frac_short = _pool_volume_fraction(pool_vol_24h=60.0, ohlcv_1h=_bars(6, 10.0))
+    check(frac_short == 1.0, "< 12 bars → fraction=1.0 (insufficient data)", f"got={frac_short}")
+
+    # Empty bars → 1.0
+    frac_empty = _pool_volume_fraction(pool_vol_24h=60.0, ohlcv_1h=[])
+    check(frac_empty == 1.0, "empty bars → fraction=1.0", f"got={frac_empty}")
+
+    # Pro-rating: only 12 bars (half a day) → estimate full-day token vol = 12*10 * (24/12) = 240
+    frac_12 = _pool_volume_fraction(pool_vol_24h=60.0, ohlcv_1h=_bars(12, 10.0))
+    check(abs(frac_12 - 0.25) < 0.01, "12-bar pro-rate (60/240=0.25)", f"got={frac_12:.4f}")
+
+    # Verify volume_scale actually reduces fee proxy in backtester
+    candidate = CandidateRange(
+        lower_price=90.0, upper_price=110.0,
+        lower_tick=-200, upper_tick=200,
+        width_pct=0.20, center_price=100.0, range_type="volatility_band",
+    )
+    price_bars = [{"time": i * 3600, "open": 100.0, "high": 101.0,
+                   "low": 99.0, "close": 100.0, "volume": 1_000_000.0} for i in range(48)]
+    bt_full  = backtest_candidate(price_bars, candidate, 48, 0.003, 1_000_000, volume_scale=1.0)
+    bt_half  = backtest_candidate(price_bars, candidate, 48, 0.003, 1_000_000, volume_scale=0.5)
+    bt_tenth = backtest_candidate(price_bars, candidate, 48, 0.003, 1_000_000, volume_scale=0.1)
+    check(bt_half.cumulative_fee_proxy < bt_full.cumulative_fee_proxy,
+          "volume_scale=0.5 → lower fee_proxy than 1.0",
+          f"full={bt_full.cumulative_fee_proxy:.4f} half={bt_half.cumulative_fee_proxy:.4f}")
+    check(abs(bt_half.cumulative_fee_proxy / bt_full.cumulative_fee_proxy - 0.5) < 0.001,
+          "fee_proxy scales linearly with volume_scale",
+          f"ratio={bt_half.cumulative_fee_proxy / bt_full.cumulative_fee_proxy:.4f}")
+    check(bt_tenth.cumulative_fee_proxy < bt_half.cumulative_fee_proxy,
+          "volume_scale=0.1 < 0.5 → further reduced fee_proxy", "")
+    check(bt_full.il_cost_proxy == bt_half.il_cost_proxy,
+          "IL cost is unchanged by volume_scale (price path unchanged)", "")
+    check(bt_full.in_range_time_ratio == bt_half.in_range_time_ratio,
+          "in_range_time_ratio unchanged (only fee affected)", "")
+
+
 def test_schema_fields() -> None:
     section("A8. Schema Field Completeness")
     from app.models.schemas import RangeRecommendation, RangeProfile
@@ -810,6 +873,7 @@ async def main() -> None:
     test_blended_utility_formula()
     test_width_floor_in_generator()
     test_launch_scenarios()
+    test_volume_fraction()
     test_schema_fields()
 
     # ── B. Integration tests ──────────────────────────────────────────────────
