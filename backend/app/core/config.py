@@ -42,9 +42,33 @@ class Settings(BaseSettings):
     monitored_chains: str = "501,8453,56"
     universe_top_n: int = 200
 
+    # ── Range Recommendation Engine ────────────────────────────────────
+    # Utility scoring weights (must sum to 1.0 for fee; penalties are subtracted)
+    range_weight_fee: float = 0.30
+    range_weight_il: float = 0.25
+    range_weight_breach: float = 0.25
+    range_weight_rebalance: float = 0.10
+    range_weight_quality: float = 0.10
+
+    # OHLCV bars to fetch per recommendation (1H bars; 300 = ~12.5 days)
+    range_ohlcv_bars: int = 300
+
+    # Redis TTL for cached recommendations (seconds)
+    range_cache_ttl: int = 300
+
     @property
     def chain_list(self) -> list[str]:
         return [c.strip() for c in self.monitored_chains.split(",")]
+
+    @property
+    def range_scoring_weights(self) -> dict[str, float]:
+        return {
+            "fee":       self.range_weight_fee,
+            "il":        self.range_weight_il,
+            "breach":    self.range_weight_breach,
+            "rebalance": self.range_weight_rebalance,
+            "quality":   self.range_weight_quality,
+        }
 
 
 settings = Settings()
