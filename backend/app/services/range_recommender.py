@@ -427,11 +427,45 @@ async def recommend_range(
         pool_address, volume_fraction, pool["volume_24h"],
     )
 
+    # P2.1.3: source quality promotion.
+    #
+    # Promotion conditions (→ "pool_candle", sq_factor=0.7):
+    #   - pool["volume_24h"] > 0   : DexScreener has pool-specific volume data
+    #   - len(ohlcv_1h) >= 12      : enough bars to make volume_fraction reliable
+    #   Note: volume_fraction == 1.0 (dominant pool) still qualifies — what matters
+    #   is that pool-specific volume data *exists*, not the magnitude of the ratio.
+    #
+    # Fallback conditions (→ "token_level", sq_factor=0.4):
+    #   - pool["volume_24h"] == 0  : DexScreener has no pool volume (new / unlisted)
+    #   - len(ohlcv_1h) < 12       : too few bars to compute a reliable fraction
+    #
+    # Expected impact on history_sufficiency.assess():
+    #   evidence_score     : +0.06  (0.20 × Δsq_factor = 0.20 × 0.30)
+    #   uncertainty_penalty: −0.03  (0.10 × Δsource_penalty = 0.10 × −0.30)
+    #   replay_weight      : grows by ~0.12 for growing pools (evidence crosses 0.65)
+    #   actionability      : growing pools near the 0.65 boundary may flip
+    #                        caution → standard
+    #
+    # Validation summary (P2.1.3):
+    #   ✓ mature pool  (bars≥12, vol>0)  → source_quality=pool_candle, sq=0.7
+    #   ✓ dominant pool (fraction=1.0)   → source_quality=pool_candle, sq=0.7
+    #   ✓ fresh pool   (bars<12)         → source_quality=token_level,  sq=0.4
+    #   ✓ no-vol pool  (vol==0)          → source_quality=token_level,  sq=0.4
+    _source_quality = (
+        "pool_candle"
+        if pool["volume_24h"] > 0 and len(ohlcv_1h) >= 12
+        else "token_level"
+    )
+    logger.info(
+        "range_recommender: pool=%.8s source_quality=%s",
+        pool_address, _source_quality,
+    )
+
     # Quick first-pass sufficiency assessment to decide whether to fetch finer bars
     sufficiency_1h = assess(
         pool_age_hours=pool_age_hours,
         bars_1h=len(ohlcv_1h),
-        source_quality="token_level",
+        source_quality=_source_quality,
     )
 
     # Fetch finer-resolution bars for growing/fresh/infant pools
@@ -448,7 +482,7 @@ async def recommend_range(
         bars_1h=len(ohlcv_1h),
         bars_5m=len(ohlcv_5m),
         bars_1m=len(ohlcv_1m),
-        source_quality="token_level",
+        source_quality=_source_quality,
     )
 
     # Select active bars and matching annualisation factor
