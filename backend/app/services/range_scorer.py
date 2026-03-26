@@ -19,6 +19,7 @@ Default weights (configurable via config.py):
 """
 from __future__ import annotations
 import logging
+import math
 from dataclasses import field
 
 from app.models.schemas import (
@@ -47,6 +48,97 @@ DEFAULT_WEIGHTS: dict[str, float] = {
 # We scale by an annualisation factor to get APR-like number
 _FEE_SCORE_FULL_APR = 3.0       # 300% APR → FeeScore = 1.0
 _REBALANCE_COST_PER_EVENT = 0.001  # 0.1% of capital per rebalance (rough gas + slippage)
+_BARS_PER_YEAR = 8760.0         # 1h bars per year
+
+
+# ── Analytical terminal OOR helpers (P2.2.3) ───────────────────────────────
+
+def _normal_cdf(x: float) -> float:
+    """Standard normal CDF via math.erf — no scipy dependency."""
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+
+def _analytical_terminal_oor(
+    realized_vol_annual: float,
+    drift_slope: float,
+    lower_price: float,
+    upper_price: float,
+    entry_price: float,
+    horizon_bars: int,
+    bars_per_year: float = _BARS_PER_YEAR,
+) -> float | None:
+    """
+    GBM terminal OOR probability: P(price_T outside [lower, upper]) starting
+    from entry_price after horizon_bars steps.
+
+    IMPORTANT — this is a *terminal OOR proxy*, NOT a first-exit / barrier-hit
+    probability.  True breach probability (first-passage) >= this value.
+    Use only as a conservative lower-bound correction for young pools where
+    replay history is too short to estimate OOR directly.
+
+    Returns None for degenerate inputs.  Callers MUST NOT substitute 0.0 for
+    None — that would silently understate breach risk on fresh/infant pools.
+    """
+    if entry_price <= 0 or lower_price <= 0 or upper_price <= 0:
+        return None
+    if lower_price >= upper_price or horizon_bars < 1:
+        return None
+
+    sigma_bar = realized_vol_annual / math.sqrt(bars_per_year)
+    sigma_T   = sigma_bar * math.sqrt(horizon_bars)
+    mu_T      = drift_slope * horizon_bars
+
+    if sigma_T < 1e-9:
+        # Deterministic: check if terminal drift stays inside range
+        log_lo = math.log(lower_price / entry_price)
+        log_hi = math.log(upper_price / entry_price)
+        return 0.0 if log_lo <= mu_T <= log_hi else 1.0
+
+    z_upper = (math.log(upper_price / entry_price) - mu_T) / sigma_T
+    z_lower = (math.log(lower_price / entry_price) - mu_T) / sigma_T
+    p_in_range = _normal_cdf(z_upper) - _normal_cdf(z_lower)
+    return max(0.0, min(1.0, 1.0 - p_in_range))
+
+
+def compute_blended_oor(
+    backtest: BacktestResult,
+    regime: RegimeResult,
+    candidate: CandidateRange,
+    horizon_bars: int,
+    replay_weight: float = 1.0,
+    entry_price: float | None = None,
+) -> float:
+    """
+    Blend replay OOR history with analytical terminal OOR proxy (P2.2.3).
+
+    replay_weight = 1.0  →  pure replay (mature pool, default — backward-compat)
+    replay_weight = 0.0  →  pure analytical (infant pool)
+
+    When analytical inputs are invalid (returns None), falls back to replay_oor
+    rather than 0.0 — invalid inputs must never deflate breach risk.
+
+    entry_price: current spot price (preferred).  Falls back to candidate.center_price.
+    """
+    replay_oor = 1.0 - backtest.in_range_time_ratio
+
+    # Reference price: spot first, center_price as fallback
+    ref_price = entry_price if (entry_price and entry_price > 0) else candidate.center_price
+
+    analytical = _analytical_terminal_oor(
+        realized_vol_annual=regime.realized_vol,
+        drift_slope=regime.drift_slope,
+        lower_price=candidate.lower_price,
+        upper_price=candidate.upper_price,
+        entry_price=ref_price,
+        horizon_bars=horizon_bars,
+    )
+
+    if analytical is None:
+        # Invalid inputs: return replay_oor — do not pull breach risk toward 0
+        return replay_oor
+
+    blended = replay_weight * replay_oor + (1.0 - replay_weight) * analytical
+    return round(max(0.0, min(1.0, blended)), 4)
 
 
 def _fee_score(backtest: BacktestResult, horizon_bars: int, bars_per_year: float = 8760.0) -> float:
@@ -74,15 +166,31 @@ def _il_score(backtest: BacktestResult, il_result: ILRiskResult) -> float:
     return round(0.60 * backtest_il + 0.40 * heuristic_il, 4)
 
 
-def _breach_risk(backtest: BacktestResult, regime: RegimeResult) -> float:
+def _breach_risk(
+    backtest: BacktestResult,
+    regime: RegimeResult,
+    candidate: CandidateRange,
+    horizon_bars: int,
+    replay_weight: float = 1.0,
+    entry_price: float | None = None,
+) -> float:
     """
-    BreachRisk = (1 - in_range_time_ratio) weighted by breach count and jump ratio.
-    """
-    oor_ratio = 1.0 - backtest.in_range_time_ratio            # 0–1
-    breach_penalty = min(backtest.breach_count / 10.0, 1.0)   # normalise to 0–1
-    jump_penalty = min(regime.jump_ratio * 5.0, 1.0)           # 0–1
+    BreachRisk = blended OOR (replay + analytical terminal proxy) weighted by
+    breach count and jump ratio.
 
-    # Blend: 60% OOR ratio + 25% breach count + 15% jump ratio
+    The oor_ratio component uses compute_blended_oor() so that scoring and
+    the breach_probability display field share the same underlying signal (P2.2.3).
+    jump_penalty is kept separate to avoid double-counting with the analytical
+    formula (which deliberately excludes jump adjustment).
+    """
+    oor_ratio = compute_blended_oor(
+        backtest, regime, candidate, horizon_bars,
+        replay_weight=replay_weight, entry_price=entry_price,
+    )
+    breach_penalty = min(backtest.breach_count / 10.0, 1.0)   # normalise to 0–1
+    jump_penalty   = min(regime.jump_ratio * 5.0, 1.0)         # 0–1
+
+    # Blend: 60% blended OOR + 25% breach count + 15% jump ratio
     return round(0.60 * oor_ratio + 0.25 * breach_penalty + 0.15 * jump_penalty, 4)
 
 
@@ -159,6 +267,8 @@ def score_candidate(
     tvl_usd: float = 1.0,
     horizon_bars: int = 48,
     weights: dict[str, float] | None = None,
+    replay_weight: float = 1.0,
+    entry_price: float | None = None,
 ) -> ScoredRange:
     """
     Compute utility score for a single candidate range.
@@ -182,7 +292,10 @@ def score_candidate(
 
     fee_s = _fee_score(backtest, horizon_bars)
     il_s = _il_score(backtest, il_result)
-    breach_r = _breach_risk(backtest, regime_result)
+    breach_r = _breach_risk(
+        backtest, regime_result, candidate, horizon_bars,
+        replay_weight=replay_weight, entry_price=entry_price,
+    )
     rebalance_c = _rebalance_cost(backtest, tvl_usd)
     quality_p = _quality_penalty(quality_result, regime_result)
 
@@ -221,12 +334,18 @@ def score_all_candidates(
     tvl_usd: float = 1.0,
     horizon_bars: int = 48,
     weights: dict[str, float] | None = None,
+    replay_weight: float = 1.0,
+    entry_price: float | None = None,
 ) -> list[ScoredRange]:
     """
     Score all candidates and return sorted by utility_score descending.
     """
     scored = [
-        score_candidate(c, b, il_result, quality_result, regime_result, tvl_usd, horizon_bars, weights)
+        score_candidate(
+            c, b, il_result, quality_result, regime_result,
+            tvl_usd, horizon_bars, weights,
+            replay_weight=replay_weight, entry_price=entry_price,
+        )
         for c, b in zip(candidates, backtests)
     ]
     scored.sort(key=lambda s: s.utility_score, reverse=True)

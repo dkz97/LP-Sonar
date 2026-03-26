@@ -50,7 +50,12 @@ from app.services.range_generator import (
     infer_pool_type,
     infer_v3_tick_spacing,
 )
-from app.services.range_scorer import DEFAULT_WEIGHTS, score_all_candidates, select_profiles
+from app.services.range_scorer import (
+    DEFAULT_WEIGHTS,
+    compute_blended_oor,
+    score_all_candidates,
+    select_profiles,
+)
 from app.services.regime_detector import detect_regime
 
 logger = logging.getLogger(__name__)
@@ -225,6 +230,8 @@ def _scored_to_profile(
     scenario_utility: Optional[float] = None,
     final_utility: Optional[float] = None,
     young_pool_adjustments: list[str] | None = None,
+    # P2.2.3: pre-computed blended OOR (replay + analytical terminal proxy)
+    blended_breach: Optional[float] = None,
 ) -> RangeProfile:
     """Convert a ScoredRange to a RangeProfile for the API response."""
     c = scored.candidate
@@ -237,8 +244,10 @@ def _scored_to_profile(
     # IL cost: make positive fraction for display
     expected_il_cost = abs(b.il_cost_proxy)
 
-    # Breach probability ≈ OOR ratio
-    breach_probability = 1.0 - b.in_range_time_ratio
+    # Breach probability: blended replay+analytical proxy when available (P2.2.3)
+    # blended_breach is the terminal OOR proxy — NOT first-exit probability.
+    # Falls back to pure replay OOR when not provided (backward-compat).
+    breach_probability = blended_breach if blended_breach is not None else (1.0 - b.in_range_time_ratio)
 
     # Rebalance frequency per 7 days
     if horizon_bars > 0:
@@ -639,6 +648,8 @@ async def recommend_range(
         tvl_usd=pool["tvl_usd"],
         horizon_bars=horizon_bars,
         weights=weights,
+        replay_weight=sufficiency.replay_weight,   # P2.2.3: tier-adaptive blending
+        entry_price=current_price,                  # P2.2.3: current spot as reference
     )
 
     # ── 7. Scenario PnL ──────────────────────────────────────────────────
@@ -682,6 +693,18 @@ async def recommend_range(
     # to use final_utility instead of utility_score for sorting)
     profiles_raw = _select_profiles_by_final_utility(scored, final_utilities)
 
+    # P2.2.3: pre-compute blended OOR for every candidate once — same value feeds
+    # both _breach_risk() in scoring (already done above) and breach_probability display.
+    blended_oor_map: dict[int, float] = {
+        id(s): compute_blended_oor(
+            s.backtest, regime_result, s.candidate,
+            horizon_bars=horizon_bars,
+            replay_weight=sufficiency.replay_weight,
+            entry_price=current_price,
+        )
+        for s in scored
+    }
+
     # Fee persistence shrinkage — only applied for young pools (fresh/infant/growing).
     # Mature pools may have non-zero jump_ratio but their fee estimates are reliable.
     is_young_pool = sufficiency.history_tier in ("fresh", "infant", "growing")
@@ -718,6 +741,7 @@ async def recommend_range(
             scenario_utility=sc_util,
             final_utility=fu,
             young_pool_adjustments=yp_adjustments if yp_adjustments else None,
+            blended_breach=blended_oor_map.get(id(s)),
         )
 
     best       = profiles_raw.get("balanced")
@@ -744,6 +768,7 @@ async def recommend_range(
                 scenario_utility=sc_util,
                 final_utility=fu,
                 young_pool_adjustments=yp_adjustments if yp_adjustments else None,
+                blended_breach=blended_oor_map.get(id(s)),
             ))
             selected_ticks.add(key)
 
