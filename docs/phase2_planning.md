@@ -43,15 +43,26 @@ Phase 2 should be tackled in priority order below. Each P2.x block is independen
 
 **Problem:** Fee tier errors of 6× (0.05% vs 0.3%) or 3× (0.3% vs 1%) are common and directly multiply into fee APR error.
 
-**Fix options:**
-1. Parse fee tier from DexScreener `pair.feeTier` (available for some protocols) — zero new API calls
-2. For Solana: parse from Raydium/Meteora on-chain pool metadata
+**Status: Partially implemented — primary path blocked by data gap.**
 
-**Implementation:**
-- Update `_infer_fee_rate()` to check `pair.feeTier` from DexScreener response first
-- Fallback to existing lookup for protocols that don't expose it
+DexScreener `/latest/dex/pairs/{chain}/{address}` does NOT expose `feeTier` in their API response (confirmed live across Ethereum, Base, BSC, Polygon for Uniswap V3, Aerodrome, PancakeSwap V3). The field is always absent. The original fix option 1 ("available for some protocols") was incorrect.
 
-**Risk:** Low — additive change to existing inference logic.
+**What was done (2026-03-26):**
+- `_infer_fee_rate()` updated with `feeTier`-first priority: checks `pair.feeTier` before static lookup
+- Future-proof: if DexScreener ever adds `feeTier`, the primary path activates automatically
+- No regression: graceful fallback to static lookup when `feeTier` absent
+- 10 A10 unit tests verify all three tiers (0.05%/0.3%/1%), string casting, None/zero/invalid edge cases
+
+**What does NOT work yet:**
+- Fee tier accuracy for Uniswap V3 pools that use non-standard tiers (0.05%, 1%) — still defaults to 0.3%
+
+**Revised fix options:**
+1. ~~DexScreener `pair.feeTier`~~ — field does not exist in their API
+2. Uniswap V3 subgraph (`fee` field on `Pool` entity) — requires new GraphQL dependency per chain
+3. On-chain RPC call to `pool.fee()` — requires RPC endpoint per chain
+4. Parse from pool name/symbol if DexScreener or other sources include it in pair metadata
+
+**Recommendation:** Defer until a reliable zero-dependency source is confirmed. The static lookup is the current effective resolver.
 
 ---
 

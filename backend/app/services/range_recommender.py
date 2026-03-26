@@ -130,7 +130,7 @@ async def _fetch_pool_state(chain_index: str, pool_address: str) -> dict | None:
     quote_symbol = (quote_token.get("symbol") or "").upper()
     quote_type = _classify_quote_type(quote_symbol)
 
-    # Fee rate: DexScreener doesn't expose fee; infer from protocol
+    # Fee rate: use DexScreener pair.feeTier when present (P2.1.2); else static lookup
     fee_rate = _infer_fee_rate(dex_id, pair)
 
     return {
@@ -831,9 +831,28 @@ def _classify_quote_type(quote_symbol: str) -> str:
 
 
 def _infer_fee_rate(dex_id: str, pair: dict) -> float:
-    """Infer fee rate from dex_id or fall back to 0.3%."""
+    """
+    Resolve fee rate for this pool.
+
+    Priority 1: DexScreener pair.feeTier (Uniswap V3 convention — integer in units of
+                1/1_000_000, e.g. 500 → 0.05%, 3000 → 0.3%, 10000 → 1%).
+                Present for Uniswap V3 and compatible protocols; absent for others.
+    Priority 2: Static lookup by dex_id.
+    Priority 3: Default 0.3%.
+    """
+    # Priority 1: DexScreener feeTier (present for Uni V3 and compatible protocols)
+    fee_tier_raw = pair.get("feeTier")
+    if fee_tier_raw is not None:
+        try:
+            bps = float(fee_tier_raw)
+            if bps > 0:
+                return bps / 1_000_000.0   # e.g. 500 → 0.0005, 3000 → 0.003
+        except (TypeError, ValueError):
+            pass
+
+    # Priority 2: static lookup by protocol
     _DEFAULT_FEES: dict[str, float] = {
-        "uniswap-v3":     0.003,    # most common tier; actual varies
+        "uniswap-v3":     0.003,    # fallback only; actual tier varies
         "pancakeswap-v3": 0.0025,
         "meteora-dlmm":   0.003,
         "meteora":        0.0025,

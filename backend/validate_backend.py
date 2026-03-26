@@ -387,6 +387,46 @@ def test_volume_fraction() -> None:
           "in_range_time_ratio unchanged (only fee affected)", "")
 
 
+def test_fee_tier_resolution() -> None:
+    section("A10. Fee Tier Resolution (P2.1.2)")
+    from app.services.range_recommender import _infer_fee_rate
+
+    # ── Priority 1: feeTier present → use it, ignore static lookup ───────────
+    r = _infer_fee_rate("uniswap-v3", {"feeTier": 500})
+    check(abs(r - 0.0005) < 1e-9, "feeTier=500 → 0.05% (overrides 0.3% static)", f"got={r}")
+
+    r = _infer_fee_rate("uniswap-v3", {"feeTier": 3000})
+    check(abs(r - 0.003) < 1e-9,  "feeTier=3000 → 0.3%", f"got={r}")
+
+    r = _infer_fee_rate("uniswap-v3", {"feeTier": 10000})
+    check(abs(r - 0.01) < 1e-9,   "feeTier=10000 → 1.0%", f"got={r}")
+
+    # feeTier as string (DexScreener may return numbers as JSON strings)
+    r = _infer_fee_rate("uniswap-v3", {"feeTier": "500"})
+    check(abs(r - 0.0005) < 1e-9, "feeTier='500' string → 0.05% (cast works)", f"got={r}")
+
+    # ── Priority 2: feeTier absent → static lookup ────────────────────────────
+    r = _infer_fee_rate("raydium-clmm", {})
+    check(abs(r - 0.0025) < 1e-9, "no feeTier + raydium-clmm → 0.25% static", f"got={r}")
+
+    r = _infer_fee_rate("aerodrome", {})
+    check(abs(r - 0.0005) < 1e-9, "no feeTier + aerodrome → 0.05% static", f"got={r}")
+
+    # ── Priority 3: unknown dex, no feeTier → 0.3% default ───────────────────
+    r = _infer_fee_rate("unknown-dex", {})
+    check(abs(r - 0.003) < 1e-9,  "no feeTier + unknown-dex → 0.3% default", f"got={r}")
+
+    # ── Edge cases: malformed feeTier → graceful fallback ────────────────────
+    r = _infer_fee_rate("uniswap-v3", {"feeTier": None})
+    check(abs(r - 0.003) < 1e-9,  "feeTier=None → static fallback (no crash)", f"got={r}")
+
+    r = _infer_fee_rate("uniswap-v3", {"feeTier": 0})
+    check(abs(r - 0.003) < 1e-9,  "feeTier=0 → static fallback (zero = missing)", f"got={r}")
+
+    r = _infer_fee_rate("uniswap-v3", {"feeTier": "invalid"})
+    check(abs(r - 0.003) < 1e-9,  "feeTier='invalid' → static fallback (bad value)", f"got={r}")
+
+
 def test_schema_fields() -> None:
     section("A8. Schema Field Completeness")
     from app.models.schemas import RangeRecommendation, RangeProfile
@@ -639,6 +679,69 @@ async def test_integration_solana_pool() -> None:
     _validate_recommendation(r, "Solana-pool", should_recommend=True)
 
 
+async def test_integration_eth_univ3_fee_tier() -> None:
+    section("B4. Integration — Ethereum Uniswap V3 feeTier (P2.1.2)")
+    import httpx
+    from app.services.range_recommender import _infer_fee_rate
+
+    # USDC/WETH 0.05% pool on Ethereum mainnet
+    POOL_ADDRESS = "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"
+    url = f"https://api.dexscreener.com/latest/dex/pairs/ethereum/{POOL_ADDRESS}"
+    print(f"  {INFO} Fetching Ethereum Uniswap V3 USDC/WETH 0.05% pool…")
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        _warn("ETH UniV3 feeTier: DexScreener unreachable, skipping", str(e))
+        return
+
+    pairs = data.get("pairs") or []
+    if not pairs:
+        _warn("ETH UniV3 feeTier: no pairs returned, skipping", "")
+        return
+
+    pair = pairs[0]
+    fee_tier_raw = pair.get("feeTier")
+    dex_id = (pair.get("dexId") or "").lower()
+    labels = pair.get("labels") or []
+    tvl = float((pair.get("liquidity") or {}).get("usd") or 0)
+    print(f"  {INFO} Found: TVL=${tvl/1e6:.1f}M dexId={dex_id} labels={labels} feeTier={fee_tier_raw!r}")
+
+    # FINDING: DexScreener does NOT expose feeTier in their pairs API (confirmed
+    # across Ethereum, Base, BSC, Polygon for Uniswap V3, Aerodrome, PancakeSwap V3).
+    # The field is absent; pair.get("feeTier") returns None.
+    # Our _infer_fee_rate() correctly falls back to the static lookup in this case.
+    # This test validates:
+    #   (a) pool is reachable and identified as Uniswap V3 (via labels)
+    #   (b) _infer_fee_rate() does not crash on None feeTier → graceful static fallback
+    #   (c) if feeTier is ever added by DexScreener, the primary path code is exercised
+
+    check("uniswap" in dex_id, "pool reachable, dexId contains 'uniswap'", f"got={dex_id}")
+    check("v3" in labels, "pool has 'v3' label (confirms V3 pool)", f"labels={labels}")
+
+    if fee_tier_raw is None:
+        # Expected finding: DexScreener does not expose feeTier
+        _warn("feeTier absent in DexScreener API — P2.1.2 primary path inactive",
+              "DexScreener /pairs endpoint does not include feeTier for any protocol tested")
+        # Verify graceful fallback: uniswap dexId → static 0.3% default
+        resolved = _infer_fee_rate(dex_id, pair)
+        check(abs(resolved - 0.003) < 1e-9,
+              "feeTier=None → graceful static fallback (0.3%)",
+              f"resolved={resolved:.4%}")
+    else:
+        # If DexScreener ever adds feeTier, verify the primary path resolves correctly
+        resolved = _infer_fee_rate(dex_id, pair)
+        check(abs(resolved - 0.0005) < 1e-9,
+              "feeTier=500 → resolved fee_rate=0.0005 (0.05%)",
+              f"raw={fee_tier_raw} resolved={resolved:.6f}")
+        check(resolved < 0.003,
+              "feeTier path: resolved fee < 0.3% static default",
+              f"resolved={resolved:.4%} vs static=0.30%")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # C. YOUNG POOL SIMULATION — patch pool_state to simulate fresh/infant
 # ══════════════════════════════════════════════════════════════════════════════
@@ -874,12 +977,14 @@ async def main() -> None:
     test_width_floor_in_generator()
     test_launch_scenarios()
     test_volume_fraction()
+    test_fee_tier_resolution()
     test_schema_fields()
 
     # ── B. Integration tests ──────────────────────────────────────────────────
     await test_integration_mature_bsc()
     await test_integration_base_pool()
     await test_integration_solana_pool()
+    await test_integration_eth_univ3_fee_tier()
 
     # ── C. Simulation tests ───────────────────────────────────────────────────
     await test_fresh_pool_2h()
