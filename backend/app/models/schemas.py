@@ -202,6 +202,8 @@ class RangeProfile(BaseModel):
     scenario_utility: Optional[float] = None    # utility from scenario simulation component
     final_utility: Optional[float] = None       # blended final utility (replay + scenario - penalty)
     young_pool_adjustments: list[str] = []      # human-readable list of adjustments applied
+    # P2.3.1: Execution cost as fraction of position capital (gas + slippage × rebalances)
+    execution_cost_fraction: Optional[float] = None
 
 
 class RangeRecommendation(BaseModel):
@@ -227,6 +229,9 @@ class RangeRecommendation(BaseModel):
     uncertainty_penalty: float = 0.0
     replay_weight: float = 1.0
     scenario_weight: float = 0.0
+    # P2.3.1 / position_usd feature: actual position size used for execution cost calculations.
+    # min(DEFAULT_POSITION_USD, tvl×SHARE_CAP) when user did not provide a value.
+    effective_position_usd: Optional[float] = None
 
 
 @dataclass

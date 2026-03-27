@@ -46,6 +46,15 @@ _SUSTAINED_OOR_THRESHOLD = 0.30  # > 30% of bars out-of-range is "sustained"
 # Number of consecutive OOR bars that trigger a rebalance event
 _REBALANCE_OOR_STREAK = 3
 
+# P2.2.1a: In-range IL Edge Correction Heuristic
+# Amplifies IL proxy when final price is near a range boundary (more single-sided exposure).
+# This is a TERMINAL-POSITION heuristic — it does NOT model:
+#   - real on-chain tick liquidity density
+#   - fee distribution or active liquidity density
+#   - path-dependent edge occupancy (only terminal price is used)
+# True tick liquidity distribution remains a future backlog item.
+_EDGE_IL_FACTOR = 0.40
+
 
 def _clmm_il_fraction(price_ratio: float) -> float:
     """
@@ -73,6 +82,32 @@ def _capital_efficiency(width_pct: float) -> float:
         return _MAX_CAPITAL_EFFICIENCY
     eff = 1.0 / width_pct
     return min(eff, _MAX_CAPITAL_EFFICIENCY)
+
+
+def _il_edge_weight(final_price: float, lower_price: float, upper_price: float) -> float:
+    """
+    In-range IL edge correction heuristic (P2.2.1a).
+
+    Returns a multiplier for base_il when final price is inside the range:
+      - 1.0 at the range center (no amplification)
+      - up to (1 + _EDGE_IL_FACTOR) at the range boundaries
+
+    Returns 1.0 for OOR prices (the existing single-leg OOR path handles that case).
+
+    Scope limitations — this heuristic does NOT model:
+      - real on-chain tick liquidity density distribution
+      - fee distribution or active liquidity density
+      - path-dependent edge occupancy (only terminal price is considered)
+    """
+    if upper_price <= lower_price:
+        return 1.0
+    if final_price <= lower_price or final_price >= upper_price:
+        return 1.0  # OOR: handled by existing path
+    # r ∈ (0, 1) — normalised position within range
+    r = (final_price - lower_price) / (upper_price - lower_price)
+    # edge_dist ∈ [0, 1]: 0 at center, 1 at boundary
+    edge_dist = abs(r - 0.5) * 2.0
+    return 1.0 + edge_dist * _EDGE_IL_FACTOR
 
 
 def backtest_candidate(
@@ -181,14 +216,19 @@ def backtest_candidate(
     price_ratio = final_price / entry_price if entry_price > 0 else 1.0
     base_il = _clmm_il_fraction(price_ratio)
 
+    # P2.2.1a: Edge correction — amplify base_il when final price is near a boundary.
+    # Only applied to the in-range IL component; OOR path is unaffected.
+    edge_w = _il_edge_weight(final_price, lo, hi)
+    base_il_weighted = base_il * edge_w
+
     # Amplify IL if price spent significant time OOR (single-leg exposure)
     oor_ratio = 1.0 - in_range_time_ratio
     if oor_ratio > _SUSTAINED_OOR_THRESHOLD:
         # Amplify IL for the OOR portion: single-leg = full directional exposure
         single_leg_il = -(abs(price_ratio - 1.0))
-        il_cost_proxy = (base_il * in_range_time_ratio + single_leg_il * oor_ratio)
+        il_cost_proxy = (base_il_weighted * in_range_time_ratio + single_leg_il * oor_ratio)
     else:
-        il_cost_proxy = base_il
+        il_cost_proxy = base_il_weighted
 
     # Normalise fee_proxy to a per-$1-capital annual yield basis
     # fee proxy is currently in USD fee / $1 capital over horizon_bars hours

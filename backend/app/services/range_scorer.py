@@ -194,14 +194,31 @@ def _breach_risk(
     return round(0.60 * oor_ratio + 0.25 * breach_penalty + 0.15 * jump_penalty, 4)
 
 
-def _rebalance_cost(backtest: BacktestResult, tvl_usd: float) -> float:
+def _rebalance_cost(
+    backtest: BacktestResult,
+    tvl_usd: float,
+    chain_index: str = "",
+    position_usd: float = 0.0,
+) -> float:
     """
-    RebalanceCost = estimated_rebalance_cost / TVL, normalised to [0, 1].
-    Each rebalance costs ~0.1% of capital (gas + slippage proxy).
+    RebalanceCost normalised to [0, 1] for the utility penalty term.
+
+    When chain_index and position_usd are provided, uses the execution_cost module
+    (gas + slippage components, chain-aware).  A total cost of 5% or more of
+    capital → full penalty (1.0).
+
+    Fallback (position_usd ≤ 0): legacy flat-rate formula
+    (rebalance_count × 0.1%), backward-compatible.
     """
-    n_rebalances = backtest.rebalance_count
-    cost_fraction = n_rebalances * _REBALANCE_COST_PER_EVENT
-    # A cost_fraction of 5% or more → full penalty
+    if position_usd > 0:
+        from app.services.execution_cost import total_execution_cost_fraction
+        cost_fraction = total_execution_cost_fraction(
+            backtest.rebalance_count, chain_index, position_usd, tvl_usd,
+        )
+    else:
+        # Legacy: flat 0.1% per rebalance
+        cost_fraction = backtest.rebalance_count * _REBALANCE_COST_PER_EVENT
+    # Normalise: 5% total cost → full penalty
     return min(cost_fraction / 0.05, 1.0)
 
 
@@ -269,6 +286,8 @@ def score_candidate(
     weights: dict[str, float] | None = None,
     replay_weight: float = 1.0,
     entry_price: float | None = None,
+    chain_index: str = "",
+    position_usd: float = 0.0,
 ) -> ScoredRange:
     """
     Compute utility score for a single candidate range.
@@ -296,7 +315,7 @@ def score_candidate(
         backtest, regime_result, candidate, horizon_bars,
         replay_weight=replay_weight, entry_price=entry_price,
     )
-    rebalance_c = _rebalance_cost(backtest, tvl_usd)
+    rebalance_c = _rebalance_cost(backtest, tvl_usd, chain_index, position_usd)
     quality_p = _quality_penalty(quality_result, regime_result)
 
     utility = (
@@ -336,6 +355,8 @@ def score_all_candidates(
     weights: dict[str, float] | None = None,
     replay_weight: float = 1.0,
     entry_price: float | None = None,
+    chain_index: str = "",
+    position_usd: float = 0.0,
 ) -> list[ScoredRange]:
     """
     Score all candidates and return sorted by utility_score descending.
@@ -345,6 +366,7 @@ def score_all_candidates(
             c, b, il_result, quality_result, regime_result,
             tvl_usd, horizon_bars, weights,
             replay_weight=replay_weight, entry_price=entry_price,
+            chain_index=chain_index, position_usd=position_usd,
         )
         for c, b in zip(candidates, backtests)
     ]

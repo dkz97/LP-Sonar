@@ -135,8 +135,19 @@ async def _fetch_pool_state(chain_index: str, pool_address: str) -> dict | None:
     quote_symbol = (quote_token.get("symbol") or "").upper()
     quote_type = _classify_quote_type(quote_symbol)
 
-    # Fee rate: use DexScreener pair.feeTier when present (P2.1.2); else static lookup
-    fee_rate = _infer_fee_rate(dex_id, pair)
+    # ── Fee rate resolution (priority chain) ─────────────────────────────
+    # Priority 1: protocol-native API / subgraph (most accurate)
+    # Priority 2: _infer_fee_rate() — DexScreener feeTier + static lookup (fallback)
+    from app.services.fee_fetcher import fetch_protocol_fee_rate
+    native_fee = await fetch_protocol_fee_rate(dex_id, pool_address, chain_index, pair)
+    if native_fee is not None:
+        fee_rate = native_fee
+        logger.debug(
+            "_fetch_pool_state: native fee pool=%.8s dex=%s fee=%.5f",
+            pool_address, dex_id, fee_rate,
+        )
+    else:
+        fee_rate = _infer_fee_rate(dex_id, pair)
 
     return {
         "pool_address":      pool_address,
@@ -232,6 +243,10 @@ def _scored_to_profile(
     young_pool_adjustments: list[str] | None = None,
     # P2.2.3: pre-computed blended OOR (replay + analytical terminal proxy)
     blended_breach: Optional[float] = None,
+    # P2.3.1: execution cost context
+    chain_index: str = "",
+    position_usd: float = 0.0,
+    tvl_usd: float = 0.0,
 ) -> RangeProfile:
     """Convert a ScoredRange to a RangeProfile for the API response."""
     c = scored.candidate
@@ -258,6 +273,31 @@ def _scored_to_profile(
     # Use shrunk fee APR for display if provided (young pool)
     display_fee_apr = shrunk_fee_apr if shrunk_fee_apr is not None else expected_fee_apr
 
+    # P2.3.1: Execution cost — compute fraction and deduct from net PnL display
+    exec_cost_frac: Optional[float] = None
+    if position_usd > 0:
+        from app.services.execution_cost import (
+            total_execution_cost_fraction as _exec_total,
+            execution_cost_breakdown as _exec_breakdown,
+        )
+        exec_cost_frac = _exec_total(b.rebalance_count, chain_index, position_usd, tvl_usd)
+
+    # Net PnL: subtract execution cost from backtest proxy (backtest layer stays pure)
+    net_pnl = b.realized_net_pnl_proxy - (exec_cost_frac or 0.0)
+
+    # Risk flag for notable execution cost (> 0.5% of capital)
+    risk_flags_out = list(scored.risk_flags)
+    if exec_cost_frac is not None and exec_cost_frac > 0.005 and b.rebalance_count > 0:
+        bd = _exec_breakdown(b.rebalance_count, chain_index, position_usd, tvl_usd)
+        dominant = (
+            "gas-dominated" if bd["gas_fraction"] > bd["slippage_fraction"]
+            else "slippage-dominated"
+        )
+        risk_flags_out.append(
+            f"Execution cost {exec_cost_frac * 100:.1f}% of capital "
+            f"({dominant}, {b.rebalance_count} rebalances)"
+        )
+
     return RangeProfile(
         lower_price=c.lower_price,
         upper_price=c.upper_price,
@@ -269,10 +309,10 @@ def _scored_to_profile(
         expected_il_cost=round(expected_il_cost, 4),
         breach_probability=round(breach_probability, 4),
         expected_rebalance_frequency=round(rebalance_per_7d, 2),
-        expected_net_pnl=round(b.realized_net_pnl_proxy, 6),
+        expected_net_pnl=round(net_pnl, 6),
         utility_score=scored.utility_score,
         reasons=scored.reasons,
-        risk_flags=scored.risk_flags,
+        risk_flags=risk_flags_out,
         scenario_pnl=scenario_pnl or {},
         # Phase 1.5 fields
         shrunk_fee_apr=round(shrunk_fee_apr, 4) if shrunk_fee_apr is not None else None,
@@ -280,6 +320,8 @@ def _scored_to_profile(
         scenario_utility=scenario_utility,
         final_utility=final_utility,
         young_pool_adjustments=young_pool_adjustments or [],
+        # P2.3.1
+        execution_cost_fraction=round(exec_cost_frac, 6) if exec_cost_frac is not None else None,
     )
 
 
@@ -385,25 +427,34 @@ async def recommend_range(
     pool_address: str,
     chain_index: str,
     scoring_weights: dict[str, float] | None = None,
+    user_position_usd: float | None = None,
 ) -> RangeRecommendation:
     """
     Run the full LP range recommendation pipeline for a single pool.
 
     Parameters
     ----------
-    pool_address     Pool contract address.
-    chain_index      Internal chain ID (e.g. "501", "8453", "56").
-    scoring_weights  Optional override for utility scoring weights.
+    pool_address       Pool contract address.
+    chain_index        Internal chain ID (e.g. "501", "8453", "56").
+    scoring_weights    Optional override for utility scoring weights.
+    user_position_usd  Optional: user's LP capital in USD.  When provided,
+                       execution_cost_fraction and expected_net_pnl are tailored
+                       to this position size and the cache is bypassed (result is
+                       position-specific).  When None, uses representative default:
+                       min($10k, TVL×1%).
 
     Returns
     -------
-    RangeRecommendation with profiles and metadata.
+    RangeRecommendation with profiles and metadata, including effective_position_usd.
     """
     # ── Cache check ──────────────────────────────────────────────────────
-    cached = await _load_cached(chain_index, pool_address)
-    if cached is not None:
-        logger.debug("range_recommender: cache hit pool=%.8s", pool_address)
-        return cached
+    # Skip cache when user_position_usd is provided: result is position-specific.
+    skip_cache = user_position_usd is not None
+    if not skip_cache:
+        cached = await _load_cached(chain_index, pool_address)
+        if cached is not None:
+            logger.debug("range_recommender: cache hit pool=%.8s", pool_address)
+            return cached
 
     # ── 1. Fetch pool state ──────────────────────────────────────────────
     pool = await _fetch_pool_state(chain_index, pool_address)
@@ -638,7 +689,15 @@ async def recommend_range(
         volume_scale=volume_fraction,   # P2.1.1: pool-specific volume correction
     )
 
-    weights = scoring_weights or DEFAULT_WEIGHTS
+    # Use explicitly passed weights when provided (e.g. from tests / API override);
+    # otherwise fall back to the live settings value so .env can tune scoring.
+    weights = scoring_weights or settings.range_scoring_weights
+
+    # P2.3.1: representative position size for execution cost estimation.
+    # Uses user-provided value when present; falls back to min($10k, 1% of TVL).
+    from app.services.execution_cost import representative_position_usd as _repr_pos
+    position_usd = _repr_pos(pool["tvl_usd"], user_position_usd=user_position_usd)
+
     scored  = score_all_candidates(
         candidates=candidates,
         backtests=backtests,
@@ -650,6 +709,8 @@ async def recommend_range(
         weights=weights,
         replay_weight=sufficiency.replay_weight,   # P2.2.3: tier-adaptive blending
         entry_price=current_price,                  # P2.2.3: current spot as reference
+        chain_index=pool["chain_index"],             # P2.3.1: chain-aware gas cost
+        position_usd=position_usd,                  # P2.3.1: representative position
     )
 
     # ── 7. Scenario PnL ──────────────────────────────────────────────────
@@ -724,6 +785,14 @@ async def recommend_range(
     if use_launch:
         yp_adjustments.append("Launch-mode scenarios used")
 
+    # P2.X: compute confidence before building profiles so flags are available for injection
+    best            = profiles_raw.get("balanced")
+    raw_confidence  = final_utilities.get(id(best), best.utility_score if best else 0.0) if best else 0.0
+    confidence      = _apply_confidence_calibration(raw_confidence, regime_result.regime)
+    final_actionability, conf_floor_flags = _check_confidence_floor(
+        confidence, sufficiency.actionability
+    )
+
     # Build profiles
     profiles: dict[str, RangeProfile | None] = {}
     for pname, s in profiles_raw.items():
@@ -735,17 +804,23 @@ async def recommend_range(
         fu      = final_utilities.get(id(s), s.utility_score)
         raw_fee_apr = s.fee_score * 3.0
         shrunk  = round(raw_fee_apr * persist_factor, 4) if persist_factor < 1.0 else None
-        profiles[pname] = _scored_to_profile(
+        profile = _scored_to_profile(
             s, horizon_bars, sc_pnl,
             shrunk_fee_apr=shrunk,
             scenario_utility=sc_util,
             final_utility=fu,
             young_pool_adjustments=yp_adjustments if yp_adjustments else None,
             blended_breach=blended_oor_map.get(id(s)),
+            chain_index=pool["chain_index"],
+            position_usd=position_usd,
+            tvl_usd=pool["tvl_usd"],
         )
-
-    best       = profiles_raw.get("balanced")
-    confidence = final_utilities.get(id(best), best.utility_score if best else 0.0) if best else 0.0
+        # P2.X: inject confidence-floor risk flags into profile (visible to frontend/logs)
+        if conf_floor_flags:
+            profile = profile.model_copy(
+                update={"risk_flags": list(profile.risk_flags) + conf_floor_flags}
+            )
+        profiles[pname] = profile
 
     # ── 9. Alternative ranges ─────────────────────────────────────────────
     selected_ticks = {
@@ -762,14 +837,22 @@ async def recommend_range(
             fu = final_utilities.get(id(s), s.utility_score)
             raw_fee_apr = s.fee_score * 3.0
             shrunk = round(raw_fee_apr * persist_factor, 4) if persist_factor < 1.0 else None
-            alt_ranges.append(_scored_to_profile(
+            alt_profile = _scored_to_profile(
                 s, horizon_bars, sc_pnl,
                 shrunk_fee_apr=shrunk,
                 scenario_utility=sc_util,
                 final_utility=fu,
                 young_pool_adjustments=yp_adjustments if yp_adjustments else None,
                 blended_breach=blended_oor_map.get(id(s)),
-            ))
+                chain_index=pool["chain_index"],
+                position_usd=position_usd,
+                tvl_usd=pool["tvl_usd"],
+            )
+            if conf_floor_flags:
+                alt_profile = alt_profile.model_copy(
+                    update={"risk_flags": list(alt_profile.risk_flags) + conf_floor_flags}
+                )
+            alt_ranges.append(alt_profile)
             selected_ticks.add(key)
 
     # Quality summary
@@ -796,25 +879,74 @@ async def recommend_range(
         # Phase 1.5 fields
         history_tier=sufficiency.history_tier,
         recommendation_mode=sufficiency.recommendation_mode,
-        actionability=sufficiency.actionability,
+        actionability=final_actionability,
         pool_age_hours=sufficiency.pool_age_hours,
         effective_evidence_score=sufficiency.effective_evidence_score,
         data_quality_score=sufficiency.data_quality_score,
         uncertainty_penalty=sufficiency.uncertainty_penalty,
         replay_weight=sufficiency.replay_weight,
         scenario_weight=sufficiency.scenario_weight,
+        # P2.3.1: actual position used for execution cost estimation (explicit for frontend)
+        effective_position_usd=round(position_usd, 2),
     )
 
-    await _store_cached(chain_index, pool_address, result)
+    # Cache only when position_usd was not user-specified (result is position-generic)
+    if not skip_cache:
+        await _store_cached(chain_index, pool_address, result)
 
     logger.info(
         "range_recommender: pool=%.8s chain=%s tier=%s regime=%s confidence=%.3f "
         "actionability=%s evidence=%.2f",
         pool_address, chain_index, sufficiency.history_tier,
-        regime_result.regime, confidence, sufficiency.actionability,
+        regime_result.regime, confidence, final_actionability,
         sufficiency.effective_evidence_score,
     )
     return result
+
+
+# ── Confidence calibration helpers ─────────────────────────────────────
+
+def _apply_confidence_calibration(confidence: float, regime: str) -> float:
+    """
+    Apply regime-aware scale factor to raw final_utility confidence.
+
+    Scale factors are read from settings.confidence_regime_scales (JSON dict).
+    Each factor is clamped to [0.5, 1.0] as a safety boundary so calibration
+    cannot inflate or aggressively deflate confidence beyond reasonable limits.
+
+    Falls back to scale=1.0 on any parse error (backward compatible).
+    """
+    import json
+    try:
+        scales: dict = json.loads(settings.confidence_regime_scales)
+        raw_scale = float(scales.get(regime, 1.0))
+        scale = max(0.5, min(1.0, raw_scale))   # boundary constraint
+    except Exception:
+        scale = 1.0
+    return round(min(1.0, max(0.0, confidence * scale)), 4)
+
+
+def _check_confidence_floor(
+    confidence: float,
+    current_actionability: str,
+) -> tuple[str, list[str]]:
+    """
+    Compare confidence against settings.confidence_floor.
+
+    Returns (final_actionability, risk_flags_to_append).
+    When floor is disabled (0.0) returns unchanged values.
+    """
+    floor = settings.confidence_floor
+    if floor <= 0.0 or confidence >= floor:
+        return current_actionability, []
+
+    # Downgrade standard → caution; caution stays caution; watch_only unchanged.
+    downgraded = "caution" if current_actionability == "standard" else current_actionability
+    flag = (
+        f"Confidence below calibrated floor "
+        f"({confidence:.2f} < {floor:.2f})"
+    )
+    return downgraded, [flag]
 
 
 # ── Utility helpers ─────────────────────────────────────────────────────

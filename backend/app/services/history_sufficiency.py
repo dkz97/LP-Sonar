@@ -162,21 +162,30 @@ def assess(
     penalty = round(min(0.40, max(0.0, penalty)), 4)
 
     # ── 5. Replay / Scenario weights ──────────────────────────────────────────
-    # Evidence in [0.25, 0.75] maps replay_weight linearly 0 → 1.
-    # Below 0.25 → pure scenario. Above 0.75 → pure replay.
-    raw_replay    = (evidence - 0.25) / 0.50
+    # Evidence mapped linearly to replay_weight using calibrated bounds.
+    # Below lower_bound → pure scenario; above upper_bound → pure replay.
+    # Bounds are read from settings so they can be updated after calibration.
+    from app.core.config import settings as _settings
+    _rw_lo = _settings.replay_weight_lower_bound   # default 0.25
+    _rw_hi = _settings.replay_weight_upper_bound   # default 0.75
+    _rw_span = max(_rw_hi - _rw_lo, 1e-6)          # guard division by zero
+    raw_replay    = (evidence - _rw_lo) / _rw_span
     replay_weight = round(min(1.0, max(0.0, raw_replay)), 4)
     scenario_weight = round(1.0 - replay_weight, 4)
 
     # ── 6. Actionability ──────────────────────────────────────────────────────
+    # Thresholds are read from settings so they can be updated after calibration
+    # without changing code.  Defaults preserve original hand-crafted values.
+    _grow_std  = _settings.calibration_growing_standard_threshold  # default 0.65
+    _mat_std   = _settings.calibration_mature_standard_threshold   # default 0.55
     if tier == "infant":
         actionability = "watch_only"
     elif tier == "fresh":
         actionability = "caution"
     elif tier == "growing":
-        actionability = "standard" if evidence >= 0.65 else "caution"
+        actionability = "standard" if evidence >= _grow_std else "caution"
     else:   # mature
-        actionability = "standard" if evidence >= 0.55 else "caution"
+        actionability = "standard" if evidence >= _mat_std else "caution"
 
     return SufficiencyResult(
         history_tier=tier,
