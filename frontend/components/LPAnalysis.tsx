@@ -764,6 +764,40 @@ export function LPAnalysis({ initialChain = "8453", initialPool = "" }: LPAnalys
             adjustments={adjustments}
           />
 
+          {/* Evidence strength card: shown for non-mature pools or when blending is active */}
+          {(tier !== "mature" || (result.replay_weight != null && result.replay_weight < 1.0)) && (
+            <div style={{
+              display: "flex", gap: "20px", flexWrap: "wrap",
+              padding: "9px 14px", borderRadius: "8px",
+              background: "rgba(139,92,246,0.04)",
+              border: "1px solid rgba(139,92,246,0.18)",
+              fontSize: "11px",
+            }}>
+              <span style={{ color: "var(--text-muted)" }}>
+                证据强度&nbsp;
+                <strong style={{ color: "#a78bfa" }}>
+                  {((result.effective_evidence_score ?? 0) * 100).toFixed(0)}%
+                </strong>
+              </span>
+              {result.replay_weight != null && (
+                <span style={{ color: "var(--text-muted)" }}>
+                  历史回放权重&nbsp;
+                  <strong style={{ color: "#06b6d4" }}>
+                    {(result.replay_weight * 100).toFixed(0)}%
+                  </strong>
+                </span>
+              )}
+              {result.scenario_weight != null && result.scenario_weight > 0 && (
+                <span style={{ color: "var(--text-muted)" }}>
+                  场景模拟权重&nbsp;
+                  <strong style={{ color: "#f59e0b" }}>
+                    {(result.scenario_weight * 100).toFixed(0)}%
+                  </strong>
+                </span>
+              )}
+            </div>
+          )}
+
           {/* Profile cards */}
           <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
             <div style={{ fontSize: "12px", fontWeight: 600, color: "var(--text-secondary)", paddingLeft: "2px" }}>
