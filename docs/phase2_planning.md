@@ -83,15 +83,33 @@ DexScreener `/latest/dex/pairs/{chain}/{address}` does NOT expose `feeTier` in t
 > Improves the accuracy of backtesting and scoring for concentrated liquidity positions.
 > These are independent model improvements that don't require new data sources.
 
-### P2.2.1 Tick liquidity distribution model
+### P2.2.1a In-range IL Edge Correction Heuristic ✓ COMPLETED
 
-**Current state:** `range_backtester.py` treats the full TVL as uniformly distributed across the range. This underestimates IL near the boundaries and overestimates fee capture at the extremes.
+**Status:** Completed 2026-03-26.
 
-**Fix:** Model the TVL distribution as a simplified triangular or Gaussian concentration around the center price. Use this in `_il_cost_proxy()` to apply higher IL weight to positions at range edges.
+**What was implemented:**
+- `_EDGE_IL_FACTOR = 0.40` constant in `range_backtester.py` (heuristic, NOT real tick liquidity density)
+- `_il_edge_weight(final_price, lower_price, upper_price) -> float`: triangular multiplier, 1.0 at center, up to 1.4 at boundary, 1.0 for OOR prices
+- Applied to `base_il` in the in-range IL path only; OOR path unchanged
+- 11 A12 unit tests in `validate_backend.py`
 
-**Impact:** Wider ranges get slightly penalised relative to tighter ones for the same in-range time. More realistic IL cost estimates.
+**Scope — what this heuristic does NOT do:**
+1. Does not model real on-chain tick liquidity density distribution
+2. Does not model fee distribution or active liquidity density
+3. Does not model path-dependent edge occupancy (terminal-position only)
+4. True tick liquidity distribution model remains a future backlog item
 
-**Implementation:** Pure math change within `range_backtester.py` — no new data dependencies.
+**Impact:** When final price lands near a range boundary, `il_cost_proxy` is amplified by up to 40%. Fee proxy is unaffected. OOR path is unaffected.
+
+---
+
+### P2.2.1 True Tick Liquidity Distribution Model (BACKLOG)
+
+**Note:** This is NOT the same as P2.2.1a above. P2.2.1a is a terminal-position heuristic.
+
+True tick liquidity distribution would require modelling the TVL as triangular/Gaussian concentration around center price, applying this to both IL and fee capture across all price paths (path-dependent), and likely requiring on-chain tick data.
+
+**Implementation:** Not started. Requires on-chain tick liquidity data per tick slot.
 
 ---
 
