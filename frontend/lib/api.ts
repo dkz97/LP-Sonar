@@ -165,6 +165,8 @@ export interface RangeProfile {
   scenario_utility?: number | null; // utility computed from scenario PnL simulation
   final_utility?: number | null;    // blended final utility: w_replay*replay + w_scenario*scenario - penalty
   young_pool_adjustments?: string[]; // human-readable list of adjustments applied for young pools
+  // P2.3.1: Execution cost as fraction of position capital (gas + slippage × rebalances)
+  execution_cost_fraction?: number | null;
 }
 
 export interface RangeRecommendation {
@@ -193,6 +195,9 @@ export interface RangeRecommendation {
   uncertainty_penalty?: number;             // 0–0.40
   replay_weight?: number;                   // 0–1
   scenario_weight?: number;                 // 0–1
+  // P2.3.1: actual position size used for execution cost calculation.
+  // min($10k, TVL×1%) when user did not provide position_usd.
+  effective_position_usd?: number | null;
 }
 
 // ── Fetch functions ────────────────────────────────────────────────────────────
@@ -234,12 +239,15 @@ export async function fetchLPOpportunities(
 
 export async function fetchLPRangeRecommendation(
   poolAddress: string,
-  chain: string
+  chain: string,
+  positionUsd?: number,
 ): Promise<RangeRecommendation> {
+  const body: Record<string, unknown> = { pool_address: poolAddress, chain };
+  if (positionUsd != null && positionUsd > 0) body.position_usd = positionUsd;
   const res = await fetch(`${API_BASE}/api/v1/lp-range/recommend`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ pool_address: poolAddress, chain }),
+    body: JSON.stringify(body),
     next: { revalidate: 0 },
   });
   if (!res.ok) {

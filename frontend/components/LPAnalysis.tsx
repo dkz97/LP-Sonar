@@ -403,7 +403,7 @@ function ProfileCard({ name, profile, isDefault }: ProfileCardProps) {
             {/* Fee APR: show shrunk version for young pools, with annotation */}
             <MetricRow
               label={profile.shrunk_fee_apr != null ? "手续费 APR (调整后)" : "预期手续费 APR"}
-              value={`${(profile.expected_fee_apr * 100).toFixed(1)}%`}
+              value={`${((profile.shrunk_fee_apr ?? profile.expected_fee_apr) * 100).toFixed(1)}%`}
               highlight={feeColor}
             />
             <MetricRow label="预估 IL 成本" value={`${(profile.expected_il_cost * 100).toFixed(2)}%`} highlight={ilColor} />
@@ -427,6 +427,13 @@ function ProfileCard({ name, profile, isDefault }: ProfileCardProps) {
                 label="场景模拟得分"
                 value={`${(profile.scenario_utility * 100).toFixed(0)}分`}
                 highlight="#a78bfa"
+              />
+            )}
+            {profile.execution_cost_fraction != null && profile.execution_cost_fraction > 0 && (
+              <MetricRow
+                label="执行成本"
+                value={`${(profile.execution_cost_fraction * 100).toFixed(3)}%`}
+                highlight="#f97316"
               />
             )}
           </div>
@@ -502,6 +509,7 @@ interface LPAnalysisProps {
 export function LPAnalysis({ initialChain = "8453", initialPool = "" }: LPAnalysisProps) {
   const [chain, setChain] = useState(initialChain);
   const [poolInput, setPoolInput] = useState(initialPool);
+  const [positionInput, setPositionInput] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<RangeRecommendation | null>(null);
@@ -512,13 +520,16 @@ export function LPAnalysis({ initialChain = "8453", initialPool = "" }: LPAnalys
     const addr = poolInput.trim();
     if (!addr) return;
 
+    const parsedPos = positionInput.trim() ? parseFloat(positionInput) : undefined;
+    const positionUsd = parsedPos != null && parsedPos > 0 ? parsedPos : undefined;
+
     setLoading(true);
     setError(null);
     setResult(null);
     setQueriedPool(addr);
 
     try {
-      const data = await fetchLPRangeRecommendation(addr, chain);
+      const data = await fetchLPRangeRecommendation(addr, chain, positionUsd);
       setResult(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : "请求失败，请检查网络或合约地址");
@@ -549,58 +560,87 @@ export function LPAnalysis({ initialChain = "8453", initialPool = "" }: LPAnalys
           </div>
         </div>
 
-        <form onSubmit={handleSubmit} style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-          {/* Chain selector */}
-          <select
-            value={chain}
-            onChange={e => setChain(e.target.value)}
-            style={{
-              background: "var(--bg-elevated)", border: "1px solid var(--border)",
-              borderRadius: "6px", color: "var(--text-primary)",
-              fontSize: "11px", fontFamily: "var(--font-mono)", fontWeight: 600,
-              padding: "0 8px", height: "36px", cursor: "pointer", outline: "none", flexShrink: 0,
-            }}
-          >
-            {CHAINS.map(c => (
-              <option key={c.value} value={c.value}>{c.label}</option>
-            ))}
-          </select>
+        <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+          {/* Row 1: chain + pool address + submit */}
+          <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+            {/* Chain selector */}
+            <select
+              value={chain}
+              onChange={e => setChain(e.target.value)}
+              style={{
+                background: "var(--bg-elevated)", border: "1px solid var(--border)",
+                borderRadius: "6px", color: "var(--text-primary)",
+                fontSize: "11px", fontFamily: "var(--font-mono)", fontWeight: 600,
+                padding: "0 8px", height: "36px", cursor: "pointer", outline: "none", flexShrink: 0,
+              }}
+            >
+              {CHAINS.map(c => (
+                <option key={c.value} value={c.value}>{c.label}</option>
+              ))}
+            </select>
 
-          {/* Pool address input */}
-          <input
-            type="text"
-            value={poolInput}
-            onChange={e => setPoolInput(e.target.value)}
-            placeholder="粘贴 LP 池合约地址…"
-            style={{
-              flex: 1, background: "var(--bg-elevated)",
-              border: "1px solid var(--border)", borderRadius: "6px",
-              color: "var(--text-primary)", fontSize: "12px",
-              fontFamily: "var(--font-mono)", padding: "0 12px",
-              height: "36px", outline: "none", transition: "border-color 150ms",
-            }}
-            onFocus={e => (e.currentTarget.style.borderColor = "var(--accent-cyan)")}
-            onBlur={e => (e.currentTarget.style.borderColor = "var(--border)")}
-          />
+            {/* Pool address input */}
+            <input
+              type="text"
+              value={poolInput}
+              onChange={e => setPoolInput(e.target.value)}
+              placeholder="粘贴 LP 池合约地址…"
+              style={{
+                flex: 1, background: "var(--bg-elevated)",
+                border: "1px solid var(--border)", borderRadius: "6px",
+                color: "var(--text-primary)", fontSize: "12px",
+                fontFamily: "var(--font-mono)", padding: "0 12px",
+                height: "36px", outline: "none", transition: "border-color 150ms",
+              }}
+              onFocus={e => (e.currentTarget.style.borderColor = "var(--accent-cyan)")}
+              onBlur={e => (e.currentTarget.style.borderColor = "var(--border)")}
+            />
 
-          {/* Submit button */}
-          <button
-            type="submit"
-            disabled={!poolInput.trim() || loading}
-            style={{
-              display: "flex", alignItems: "center", gap: "6px",
-              height: "36px", padding: "0 16px", flexShrink: 0,
-              background: poolInput.trim() && !loading ? "var(--accent-cyan)" : "var(--bg-elevated)",
-              color: poolInput.trim() && !loading ? "#fff" : "var(--text-muted)",
-              border: "1px solid " + (poolInput.trim() && !loading ? "var(--accent-cyan)" : "var(--border)"),
-              borderRadius: "6px", fontSize: "12px", fontWeight: 600,
-              fontFamily: "var(--font-sans)", cursor: poolInput.trim() && !loading ? "pointer" : "default",
-              transition: "background 150ms, color 150ms",
-            }}
-          >
-            {loading ? <Loader2 size={13} style={{ animation: "spin 1s linear infinite" }} /> : <Search size={13} />}
-            {loading ? "分析中…" : "分析"}
-          </button>
+            {/* Submit button */}
+            <button
+              type="submit"
+              disabled={!poolInput.trim() || loading}
+              style={{
+                display: "flex", alignItems: "center", gap: "6px",
+                height: "36px", padding: "0 16px", flexShrink: 0,
+                background: poolInput.trim() && !loading ? "var(--accent-cyan)" : "var(--bg-elevated)",
+                color: poolInput.trim() && !loading ? "#fff" : "var(--text-muted)",
+                border: "1px solid " + (poolInput.trim() && !loading ? "var(--accent-cyan)" : "var(--border)"),
+                borderRadius: "6px", fontSize: "12px", fontWeight: 600,
+                fontFamily: "var(--font-sans)", cursor: poolInput.trim() && !loading ? "pointer" : "default",
+                transition: "background 150ms, color 150ms",
+              }}
+            >
+              {loading ? <Loader2 size={13} style={{ animation: "spin 1s linear infinite" }} /> : <Search size={13} />}
+              {loading ? "分析中…" : "分析"}
+            </button>
+          </div>
+
+          {/* Row 2: optional position size */}
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <span style={{ fontSize: "11px", color: "var(--text-muted)", flexShrink: 0 }}>仓位规模</span>
+            <span style={{ fontSize: "11px", color: "var(--text-muted)", flexShrink: 0 }}>$</span>
+            <input
+              type="number"
+              min="1"
+              value={positionInput}
+              onChange={e => setPositionInput(e.target.value)}
+              placeholder="留空使用默认仓位"
+              style={{
+                width: "140px", background: "var(--bg-elevated)",
+                border: "1px solid var(--border)", borderRadius: "6px",
+                color: "var(--text-primary)", fontSize: "12px",
+                fontFamily: "var(--font-mono)", padding: "0 10px",
+                height: "30px", outline: "none", transition: "border-color 150ms",
+                flexShrink: 0,
+              }}
+              onFocus={e => (e.currentTarget.style.borderColor = "var(--accent-cyan)")}
+              onBlur={e => (e.currentTarget.style.borderColor = "var(--border)")}
+            />
+            <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+              USD — 未填时使用代表性默认值 (min $10k, TVL×1%)
+            </span>
+          </div>
         </form>
       </div>
 
@@ -699,8 +739,20 @@ export function LPAnalysis({ initialChain = "8453", initialPool = "" }: LPAnalys
                 </span>
               </span>
             </div>
-            <div style={{ fontSize: "11px", color: "var(--text-secondary)", fontFamily: "var(--font-mono)" }}>
-              {result.pool_quality_summary}
+            <div style={{ display: "flex", alignItems: "center", gap: "16px", flexWrap: "wrap" }}>
+              <span style={{ fontSize: "11px", color: "var(--text-secondary)", fontFamily: "var(--font-mono)" }}>
+                {result.pool_quality_summary}
+              </span>
+              {result.effective_position_usd != null && (
+                <span style={{
+                  fontSize: "10px", color: "var(--text-muted)",
+                  fontFamily: "var(--font-mono)", flexShrink: 0,
+                }}>
+                  计算仓位: <strong style={{ color: "var(--text-secondary)" }}>
+                    {formatVolume(result.effective_position_usd)}
+                  </strong>
+                </span>
+              )}
             </div>
           </div>
 
