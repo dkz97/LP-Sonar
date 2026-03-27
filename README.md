@@ -1,225 +1,177 @@
 # LP-Sonar
 
-LP-Sonar 是一个面向 **DeFi LP（Liquidity Provider）机会发现与风险监控** 的前后端分离系统，聚焦于链上 Token 与流动性池的持续扫描、分层监控、风险识别和 LP 决策支持。
+Concentrated-liquidity LP range recommendation engine for Uniswap V3 / Raydium CLMM / Meteora DLMM.
 
-它不是一个单纯的 Token 查询工具，而是一套围绕 **“发现机会 → 提升关注 → 深度分析 → 输出 LP 建议”** 构建的自动化分析系统。系统能够持续从多数据源中发现潜在热点资产，并对其流动性、成交活跃度、安全性、市场质量和无常损失风险进行综合评估，最终输出可执行的 LP 机会与风险提示。
+Given a pool address, the system returns:
+- Whether to LP the pool right now
+- Conservative / balanced / aggressive price range recommendations
+- Expected fee APR, IL cost, breach probability, net PnL per range
+- Recommendation confidence with regime-aware calibration
 
----
-
-## 项目目标
-
-在 DeFi 场景中，LP 策略并不只是“找一个池子然后进场”，而是需要持续判断：
-
-- 哪些 Token 正在快速升温
-- 哪些池子是真实活跃，而不是刷量或低质量流动性
-- 哪个池子才是某个 Token 的主池
-- 当前是否适合做 LP
-- 做 LP 的主要风险来自哪里
-- 建议采用什么持有策略与周期
-
-LP-Sonar 的目标，就是把这些判断过程系统化、自动化，并沉淀成一套可供前端直接消费的实时数据与决策结果。
+**Demo-ready baseline:** `a074e73` (branch `main`)
 
 ---
 
-## 核心能力
+## Quick Start
 
-### 1. 全市场候选发现
+### Prerequisites
+- Python 3.11+, Node.js 18+
+- Redis 7 (via Docker or local install)
+- OKX API key (for price/volume data)
 
-系统会周期性扫描市场中的候选 Token，并基于流动性、短时成交量等条件进行初筛，形成可监控的候选集合。
+### 1. Start Redis
 
-### 2. 热点分层监控
+```bash
+# Option A: Docker (recommended)
+docker compose up -d redis
 
-项目围绕以下主线运行：
+# Option B: local
+redis-server --daemonize yes
+redis-cli ping   # should return PONG
+```
 
-`Universe -> Hot -> Focus -> LP Decision`
+### 2. Backend
 
-- **Universe**：全市场候选集
-- **Hot**：通过基础门槛筛选出的热点观察层
-- **Focus**：出现量价异动、值得重点跟踪的高关注层
-- **LP Decision**：基于主池和风险评估生成的 LP 决策结果
+```bash
+cd backend
+cp .env.example .env
+# Edit .env: set OKX_ACCESS_KEY=<your_key>
 
-这种分层机制可以把“广覆盖扫描”和“深度分析”拆开处理，在效率和质量之间取得平衡。
+pip install -e .
+uvicorn app.main:app --reload --port 8000
+```
 
-### 3. 多维度深度分析
+Verify: `curl http://localhost:8000/health`
+API docs: http://localhost:8000/docs
 
-当 Token 进入 Focus 层后，系统会进一步补充：
+### 3. Frontend
 
-- 池子流动性与成交量
-- 多池拆解与主池选择
-- 安全信息（如 mint、freeze、LP burn 等）
-- Smart Money 交易行为
-- 市场质量评估
-- 无常损失风险评估
-
-### 4. LP 机会与风险输出
-
-系统不仅监控 Token，还会对主池生成面向 LP 的策略判断，包括：
-
-- 是否具备 LP 准入条件
-- 手续费收益潜力
-- 市场质量与刷量风险
-- 无常损失风险等级
-- 推荐持有周期
-- 综合 LP 评分
-
-最终输出可排序的 LP Opportunities，以及风险预警与机会告警。
-
-### 5. 面向前端的实时查询与展示
-
-前端可直接读取 Hot、Focus、Alerts、LP Opportunities 等结果；同时提供 Token Detail 查询链路，支持用户按需查看单个 Token 的基础信息、池列表、K 线和成交历史。
+```bash
+cd frontend
+npm install
+npm run dev
+# Open http://localhost:3000
+```
 
 ---
 
-## 系统架构
+## Demo
 
-LP-Sonar 采用前后端分离架构：
+### Mature pool (stable, always reproducible)
 
-- **后端**：FastAPI + APScheduler + Redis
-- **前端**：Next.js
-- **数据层核心**：Redis
-- **外部数据源**：OKX OnchainOS MCP、DexScreener、GeckoTerminal，以及 Solana 生态协议直连数据源
+| Field | Value |
+|-------|-------|
+| Chain | `501` (Solana) |
+| Pool address | `8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj` |
+| Pool | SOL/USDC · Meteora DLMM |
+| Expected signals | `history_tier=mature`, `actionability=standard`, `regime=range_bound` |
 
-其中：
+```bash
+curl "http://localhost:8000/api/v1/lp-range/501/8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj" | python3 -m json.tool
+```
 
-- **FastAPI** 提供 API 接口
-- **APScheduler** 驱动后台定时任务
-- **Redis** 负责缓存、快照、排名、告警与短期历史数据存储
-- **Next.js** 负责监控面板与详情页展示
+With explicit position size (enables `execution_cost_fraction`):
+```bash
+curl "http://localhost:8000/api/v1/lp-range/501/8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj?position_usd=1000" | python3 -m json.tool
+```
 
----
+### Young pool (find at demo time)
 
-## 工作流程
+Pools age over time, so young-pool demos require a recently-created pool:
+1. Open https://dexscreener.com/new-pairs
+2. Filter: chain = Solana or BSC, created < 6 hours ago, TVL > $30k
+3. Copy pool address and chain ID
+4. Quick check: `curl "http://localhost:8000/api/v1/lp-range/<chain>/<pool>" | python3 -m json.tool | grep history_tier`
 
-### 1. 候选发现
+Expected signals: `history_tier=fresh/growing`, `actionability=caution`, `shrunk_fee_apr` non-null.
 
-系统启动后会先进行 Universe Scan，从外部数据源中发现候选 Token，并按 TVL、短时成交量等条件推进到 Hot 层。
+### UI areas to watch during demo
 
-### 2. Hot 层监控
-
-Hot 层会持续拉取价格和成交量信息，并结合历史窗口计算异常程度，例如：
-
-- 5 分钟成交量 Z-Score
-- 价格短时涨跌幅
-
-一旦满足条件，Token 会进入 Focus 层。
-
-### 3. Focus 深度分析
-
-对于 Focus Token，系统会补齐池子信息、安全信息和链上行为，并对其多个流动性池进行评分，选出最具代表性的主池。
-
-### 4. LP 决策生成
-
-在主池基础上，系统进一步评估市场质量、LP 准入条件、无常损失风险和策略周期，生成最终 LP 决策结果。
-
-### 5. 告警与前端展示
-
-分析结果会沉淀为：
-
-- 热点列表
-- Focus 列表
-- 告警流
-- LP 机会列表
-- 单池 LP 决策详情
-
-前端通过轮询 API 获取这些结果并进行展示。
+| Area | What to show |
+|------|-------------|
+| Summary header | `regime` badge, `recommendation_confidence` bar, pool quality summary |
+| Evidence card | `effective_evidence_score`, `replay_weight`, `scenario_weight` (young pools only) |
+| Balanced profile (expanded) | Fee APR (adjusted label for young pools), scenario PnL table |
+| Aggressive profile (expanded) | `execution_cost` row (~0.2% when position_usd is set) |
 
 ---
 
-## 数据来源
+## API Reference
 
-LP-Sonar 使用多数据源协同工作，不同链路的数据优先级不同。
+### POST `/api/v1/lp-range/recommend`
 
-### 主业务数据源
+```json
+{
+  "pool_address": "8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj",
+  "chain": "501",
+  "position_usd": 1000
+}
+```
 
-- **OKX OnchainOS MCP**
-  - 用于 ranking、hot token、价格批量查询、流动性、安全信息、最近交易等核心数据
+### GET `/api/v1/lp-range/{chain}/{pool_address}`
 
-### 补充数据源
+```
+GET /api/v1/lp-range/501/8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj?position_usd=1000
+```
 
-- **DexScreener**
-  - 用于跨链池子发现、行情与成交数据补充
-
-- **GeckoTerminal**
-  - 用于明细查询、OHLCV、交易历史，以及部分回退链路
-
-### Solana 直连协议源
-
-- **Meteora**
-- **Raydium**
-- **Orca**
-
-这些直连源主要用于获取更准确的 Solana 池子元数据、费率和流动性信息。
+Supported chain IDs: `501` (Solana), `8453` (Base), `56` (BSC), `1` (Ethereum)
 
 ---
 
-## Redis 数据设计
+## Calibration
 
-Redis 是整个系统的数据中枢，承担以下职责：
+The scoring engine loads calibration parameters from `backend/data/calibration.json` on startup.
+A sample file (from 171 real pool samples) is committed and used by default.
 
-- 候选与热点分层排名
-- Token 快照存储
-- 池子快照存储
-- 历史窗口缓存
-- 告警流沉淀
-- LP 决策结果缓存
-- 明细查询短缓存
-
-系统中的关键数据包括：
-
-- `universe:{chain}`：候选 Token 排名
-- `hot:{chain}`：Hot 层排名
-- `focus:{chain}`：Focus 层排名
-- `snapshot:{chain}:{token}`：Token 最新快照
-- `pair_snapshot:{chain}:{pool}`：池子快照
-- `primary_pool:{chain}:{token}`：主池映射
-- `lp_decision:{chain}:{pool}`：单池 LP 决策
-- `lp_opportunities:{chain}`：LP 机会列表
-- `alerts`：告警流
+To re-run calibration:
+```bash
+cd backend
+python3 -m scripts.calibrate --dry-run          # preview without writing
+python3 -m scripts.calibrate --out data/calibration.json
+```
 
 ---
 
-## 前端展示能力
+## Known Issues (non-blocking)
 
-前端主要包含两类能力：
-
-### 1. 首页监控面板
-
-- Hot Token 列表
-- Focus Token 面板
-- LP Opportunities 面板
-- Alert Feed 告警流
-
-### 2. Token 明细页
-
-用户可查看单个 Token 的：
-
-- 基础信息
-- 池列表
-- OHLCV 数据
-- 交易历史
-
-这部分查询链路是按需触发的，与后台定时任务主链并行工作。
+| Issue | Impact | Status |
+|-------|--------|--------|
+| OKX provides token-level volume (not pool-specific) | Fee APR may be inflated on high-volume tokens; `volume_fraction` correction applied | Known, P2.1.1 partially mitigates |
+| Uniswap V3 fee tier: DexScreener doesn't expose `feeTier` | Non-standard tiers (0.05%, 1%) default to 0.3% | `fee_fetcher.py` ready; needs subgraph URL in `.env` |
+| Low recommendation confidence (~10–20%) | OKX token-level data reduces evidence score | Expected behavior, not a bug |
+| `calibration: loaded from ...` on startup | INFO log on every cold start | Intentional, confirms calibration is active |
 
 ---
 
-## 适用场景
+## Project Structure
 
-LP-Sonar 适合用于：
-
-- DeFi 机会发现平台
-- LP 策略辅助决策系统
-- 链上热点监控面板
-- Token / Pool 风险观察台
-- 面向研究员、交易员、策略团队的内部分析工具
-
----
-
-## 后续演进方向
-
-从当前设计来看，LP-Sonar 已具备较完整的主链路。后续可以继续增强的方向包括：
-
-- 新增LP监控功能
-- 新增刷量机器人监控
-- 对真实收益进行计算
-- 新增算法，判断最佳LP价格范围
-- 新增自动化添加/删除/替换LP
+```
+LP-Sonar/
+├── backend/
+│   ├── app/
+│   │   ├── api/v1/endpoints/lp_range.py   # HTTP layer
+│   │   ├── core/config.py                 # Settings + calibration loader
+│   │   ├── models/schemas.py              # Pydantic response models
+│   │   └── services/
+│   │       ├── range_recommender.py       # Main pipeline orchestrator
+│   │       ├── range_generator.py         # Candidate range generation
+│   │       ├── range_backtester.py        # Historical replay
+│   │       ├── range_scorer.py            # Utility scoring
+│   │       ├── range_scenario.py          # Scenario simulation
+│   │       ├── history_sufficiency.py     # Evidence assessment (Layer 0)
+│   │       ├── regime_detector.py         # Market regime (Layer B)
+│   │       ├── execution_cost.py          # Gas + slippage model
+│   │       └── fee_fetcher.py             # Protocol-native fee resolver
+│   ├── scripts/calibrate.py               # Offline calibration tool
+│   ├── data/calibration.json              # Active calibration values
+│   └── validate_backend.py                # Test suite (313 tests)
+├── frontend/
+│   ├── app/page.tsx                       # Main page
+│   ├── components/LPAnalysis.tsx          # Core UI component
+│   └── lib/api.ts                         # API client + TypeScript types
+├── docs/
+│   ├── handoff_context_2026_03_27.md      # Full algorithmic handoff doc
+│   ├── lp_recommendation_engine_spec.md   # Original spec
+│   └── phase2_planning.md                 # Roadmap
+└── docker-compose.yml                     # Redis service
+```
