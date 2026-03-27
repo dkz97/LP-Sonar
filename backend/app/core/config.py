@@ -1,3 +1,7 @@
+import json
+import logging
+import os
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +22,13 @@ class Settings(BaseSettings):
 
     # DEX Screener (cross-chain pool discovery, 300 req/min, no auth)
     dexscreener_api_url: str = "https://api.dexscreener.com"
+
+    # Uniswap V3 subgraph URLs for protocol-native fee tier (P2.1 fee tier)
+    # Set these to The Graph hosted service or your own subgraph endpoint.
+    # Leave empty to skip subgraph fetch and rely on DexScreener feeTier fallback.
+    uniswap_v3_subgraph_ethereum: str = ""
+    uniswap_v3_subgraph_base: str = ""
+    uniswap_v3_subgraph_polygon: str = ""
 
     # DeFiLlama (TVL aggregation, optional)
     defillama_api_url: str = "https://yields.llama.fi"
@@ -56,6 +67,34 @@ class Settings(BaseSettings):
     # Redis TTL for cached recommendations (seconds)
     range_cache_ttl: int = 300
 
+    # ── Calibration parameters (P2.X: confidence / offline replay calibration) ──
+    # Actionability thresholds: evidence_score level needed for "standard" rating.
+    # growing pools require stronger evidence than mature pools.
+    # Set by running scripts/calibrate.py; defaults preserve original hand-crafted values.
+    calibration_growing_standard_threshold: float = 0.65
+    calibration_mature_standard_threshold: float = 0.55
+
+    # Confidence floor: recommendation_confidence values below this trigger a
+    # caution downgrade + "Confidence below calibrated floor" risk_flag.
+    # 0.0 = disabled (backward-compatible default).
+    confidence_floor: float = 0.0
+
+    # Regime-aware confidence scale factors (JSON dict, string for .env compat).
+    # Applied multiplicatively: calibrated_conf = raw_conf × scale[regime].
+    # Boundary-constrained by calibrate.py to [0.5, 1.0] per regime.
+    confidence_regime_scales: str = (
+        '{"range_bound":1.0,"trend_up":0.85,"trend_down":0.85,"chaotic":0.70}'
+    )
+
+    # Replay weight interpolation boundaries: evidence_score in [lo, hi] maps
+    # replay_weight linearly 0 → 1.  Outside this range: clamp to 0 or 1.
+    replay_weight_lower_bound: float = 0.25
+    replay_weight_upper_bound: float = 0.75
+
+    # Path to the offline calibration output file (relative to working directory).
+    # Override via CALIBRATION_FILE_PATH env var if needed.
+    calibration_file_path: str = "data/calibration.json"
+
     @property
     def chain_list(self) -> list[str]:
         return [c.strip() for c in self.monitored_chains.split(",")]
@@ -71,4 +110,125 @@ class Settings(BaseSettings):
         }
 
 
+_calibration_logger = logging.getLogger(__name__)
+
+# Float fields that calibration.json may override.
+# confidence_floor is intentionally excluded — operational parameter, ENV only.
+_CALIBRATION_FLOAT_FIELDS: tuple[str, ...] = (
+    "calibration_growing_standard_threshold",
+    "calibration_mature_standard_threshold",
+    "replay_weight_lower_bound",
+    "replay_weight_upper_bound",
+)
+
+
+def _load_calibration_overrides(s: "Settings") -> None:
+    """
+    Load calibration.json and apply eligible fields to a Settings instance.
+
+    Priority: ENV variable > calibration.json > Settings default.
+    Fields already present in s.model_fields_set (set via ENV / .env) are skipped.
+    confidence_floor is never overridden here.
+
+    All errors are logged as WARNING; the function never raises.
+    """
+    path = s.calibration_file_path
+
+    # ── Read JSON ──────────────────────────────────────────────────────────────
+    try:
+        with open(path) as fh:
+            data: dict = json.load(fh)
+    except FileNotFoundError:
+        _calibration_logger.info(
+            "calibration: file not found at %s — using settings defaults", path
+        )
+        return
+    except json.JSONDecodeError as exc:
+        _calibration_logger.warning(
+            "calibration: JSON decode error in %s — using settings defaults: %s",
+            path, exc,
+        )
+        return
+    except OSError as exc:
+        _calibration_logger.warning(
+            "calibration: cannot read %s — using settings defaults: %s",
+            path, exc,
+        )
+        return
+
+    applied: list[str] = []
+    skipped_env: list[str] = []
+
+    # ── Float fields ───────────────────────────────────────────────────────────
+    for field in _CALIBRATION_FLOAT_FIELDS:
+        if field not in data:
+            continue
+        if field in s.model_fields_set:
+            skipped_env.append(field)
+            _calibration_logger.debug(
+                "calibration: field '%s' skipped (set by env var)", field
+            )
+            continue
+        try:
+            object.__setattr__(s, field, float(data[field]))
+            applied.append(field)
+        except (TypeError, ValueError) as exc:
+            _calibration_logger.warning(
+                "calibration: field '%s' has unexpected type %s — skipped: %s",
+                field, type(data[field]).__name__, exc,
+            )
+
+    # ── confidence_regime_scales: dict → JSON string ───────────────────────────
+    scales_key = "confidence_regime_scales"
+    if scales_key in data:
+        if scales_key in s.model_fields_set:
+            skipped_env.append(scales_key)
+            _calibration_logger.debug(
+                "calibration: field '%s' skipped (set by env var)", scales_key
+            )
+        else:
+            raw = data[scales_key]
+            if isinstance(raw, dict):
+                try:
+                    object.__setattr__(s, scales_key, json.dumps(raw))
+                    applied.append(scales_key)
+                except Exception as exc:
+                    _calibration_logger.warning(
+                        "calibration: failed to serialize '%s' — skipped: %s",
+                        scales_key, exc,
+                    )
+            else:
+                _calibration_logger.warning(
+                    "calibration: field '%s' expected dict, got %s — skipped",
+                    scales_key, type(raw).__name__,
+                )
+
+    # ── Log summary (include meta fields if present) ───────────────────────────
+    meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
+    meta_parts: list[str] = []
+    if "version" in meta:
+        meta_parts.append(f"version={meta['version']}")
+    if "generated_at" in meta:
+        meta_parts.append(f"generated_at={meta['generated_at']}")
+    if "real_samples" in meta:
+        meta_parts.append(f"real_samples={meta['real_samples']}")
+    meta_str = f" ({', '.join(meta_parts)})" if meta_parts else ""
+
+    _calibration_logger.info(
+        "calibration: loaded from %s — "
+        "growing_threshold=%.3f mature_threshold=%.3f "
+        "rw_bounds=[%.2f, %.2f] "
+        "fields applied=%d, env-overrides skipped=%d%s",
+        path,
+        s.calibration_growing_standard_threshold,
+        s.calibration_mature_standard_threshold,
+        s.replay_weight_lower_bound,
+        s.replay_weight_upper_bound,
+        len(applied),
+        len(skipped_env),
+        meta_str,
+    )
+
+
 settings = Settings()
+_load_calibration_overrides(settings)
