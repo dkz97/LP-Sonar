@@ -1,0 +1,19 @@
+{
+  "calibration_growing_standard_threshold": 0.65,
+  "calibration_mature_standard_threshold": 0.6,
+  "replay_weight_lower_bound": 0.35,
+  "replay_weight_upper_bound": 0.65,
+  "confidence_regime_scales": {
+    "range_bound": 1.0,
+    "trend_up": 0.5,
+    "trend_down": 0.5,
+    "chaotic": 0.5
+  },
+  "meta": {
+    "generated_at": "2026-03-27T06:25:19.575932+00:00",
+    "real_samples": 171,
+    "synthetic_samples": 15200,
+    "real_weight": 0.7,
+    "synthetic_weight": 0.3
+  }
+}
