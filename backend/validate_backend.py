@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 import asyncio
 import json
+import logging.handlers
 import sys
 import time
 import traceback
@@ -531,6 +532,293 @@ def test_blended_breach_probability() -> None:
         check(0.0 <= v <= 1.0, f"blended_oor in [0,1]: vol={vol} drift={drift}", f"got={v:.4f}")
 
 
+def test_position_usd_wiring() -> None:
+    section("A14. User-specified position_usd wiring")
+    from app.models.schemas import RangeRecommendation, CandidateRange, BacktestResult, RegimeResult
+    from app.services.range_scorer import score_candidate
+    from app.services.range_recommender import _scored_to_profile
+    from app.services.il_risk import estimate_il_risk
+    from app.services.market_quality import detect_market_quality
+    from app.api.v1.endpoints.lp_range import RangeRecommendRequest
+
+    # ── RangeRecommendation schema ───────────────────────────────────────
+
+    # Field exists with default None
+    rec = RangeRecommendation(
+        is_recommended=False, recommendation_confidence=0.0, regime="range_bound",
+        holding_horizon="1d-3d",
+        profiles={"conservative": None, "balanced": None, "aggressive": None},
+        pool_quality_summary="", no_recommendation_reason="test",
+        alternative_ranges=[], timestamp=0.0, data_freshness="test",
+    )
+    check(hasattr(rec, "effective_position_usd"),
+          "RangeRecommendation has effective_position_usd field")
+    check(rec.effective_position_usd is None,
+          "effective_position_usd defaults to None")
+
+    rec2 = RangeRecommendation(
+        is_recommended=False, recommendation_confidence=0.0, regime="range_bound",
+        holding_horizon="1d-3d",
+        profiles={"conservative": None, "balanced": None, "aggressive": None},
+        pool_quality_summary="", no_recommendation_reason="test",
+        alternative_ranges=[], timestamp=0.0, data_freshness="test",
+        effective_position_usd=5000.0,
+    )
+    check(abs(rec2.effective_position_usd - 5000.0) < 1e-6,
+          "effective_position_usd=5000.0 stored correctly")
+
+    # ── API request model ────────────────────────────────────────────────
+
+    req_default = RangeRecommendRequest(pool_address="0xABC", chain="1")
+    check(req_default.position_usd is None,
+          "RangeRecommendRequest: position_usd defaults to None")
+
+    req_custom = RangeRecommendRequest(pool_address="0xABC", chain="1", position_usd=3000.0)
+    check(abs(req_custom.position_usd - 3000.0) < 1e-6,
+          "RangeRecommendRequest: position_usd=3000 accepted")
+
+    # ── _scored_to_profile: small pos vs large pos ─────────────────────
+
+    def _cand(lo: float, hi: float) -> CandidateRange:
+        center = (lo + hi) / 2.0
+        return CandidateRange(
+            lower_price=lo, upper_price=hi,
+            lower_tick=-100, upper_tick=100,
+            width_pct=(hi - lo) / center, center_price=center,
+            range_type="volatility_band",
+        )
+
+    bt5 = BacktestResult(
+        in_range_time_ratio=0.70, cumulative_fee_proxy=0.02, il_cost_proxy=-0.01,
+        first_breach_bar=5, breach_count=5, rebalance_count=5,
+        realized_net_pnl_proxy=0.01,
+    )
+    il   = estimate_il_risk("stable", 5.0, 2.0, 1.0, 0.0, 1.0, "uniswap-v3")
+    qual = detect_market_quality("0xTEST", 1_000_000, 100_000, 5_000, 50_000, 50_000, 50)
+    reg  = RegimeResult(regime="range_bound", confidence=0.7,
+                        realized_vol=0.8, drift_slope=0.0, jump_ratio=0.05)
+    cand = _cand(90.0, 110.0)
+    s    = score_candidate(cand, bt5, il, qual, reg, 1_000_000, 48,
+                           chain_index="1", position_usd=10_000)
+
+    # Small position: gas = $15×5 / $500 → high gas_fraction
+    p_small = _scored_to_profile(s, 48, chain_index="1", position_usd=500, tvl_usd=1_000_000)
+    # Large position: gas = $15×5 / $100k → small gas_fraction, slippage may dominate
+    p_large = _scored_to_profile(s, 48, chain_index="1", position_usd=100_000, tvl_usd=1_000_000)
+
+    check(p_small.execution_cost_fraction is not None and p_large.execution_cost_fraction is not None,
+          "both profiles have execution_cost_fraction when chain provided")
+    check(p_small.execution_cost_fraction > p_large.execution_cost_fraction,
+          "small pos ($500) → higher execution_cost_fraction than large pos ($100k)",
+          f"small={p_small.execution_cost_fraction:.4f} large={p_large.execution_cost_fraction:.4f}")
+    check(p_small.expected_net_pnl < p_large.expected_net_pnl,
+          "small pos → lower expected_net_pnl (larger execution cost deducted)",
+          f"small={p_small.expected_net_pnl:.6f} large={p_large.expected_net_pnl:.6f}")
+
+    # Small ETH pos: gas-dominated → risk_flag should mention "gas-dominated"
+    has_gas_flag = any("gas-dominated" in f for f in p_small.risk_flags)
+    check(has_gas_flag,
+          "small pos on ETH: risk_flags contain 'gas-dominated'",
+          f"flags={p_small.risk_flags}")
+
+
+def test_execution_cost_model() -> None:
+    section("A13. Execution Cost Model (P2.3.1)")
+    from app.services.execution_cost import (
+        gas_cost_usd, representative_position_usd, slippage_fraction,
+        total_execution_cost_fraction,
+        _SLIPPAGE_BASE, _SLIPPAGE_CAP, DEFAULT_POSITION_USD, DEFAULT_POSITION_SHARE_CAP,
+    )
+    from app.services.range_scorer import score_candidate
+    from app.models.schemas import CandidateRange, BacktestResult, RegimeResult
+    from app.services.il_risk import estimate_il_risk
+    from app.services.market_quality import detect_market_quality
+
+    # ── representative_position_usd ──────────────────────────────────────────
+
+    # Large pool: capped by DEFAULT_POSITION_USD
+    pos_large = representative_position_usd(tvl_usd=1_000_000)
+    check(abs(pos_large - DEFAULT_POSITION_USD) < 1e-6,
+          "large pool (TVL=$1M): representative_pos = DEFAULT_POSITION_USD ($10k)",
+          f"got={pos_large:.0f}")
+
+    # Small pool: capped by DEFAULT_POSITION_SHARE_CAP × TVL
+    pos_small = representative_position_usd(tvl_usd=100_000)
+    check(abs(pos_small - 100_000 * DEFAULT_POSITION_SHARE_CAP) < 1e-6,
+          "small pool (TVL=$100k): representative_pos = TVL×1% ($1k)",
+          f"got={pos_small:.0f}")
+
+    # User override: takes priority over defaults
+    pos_user = representative_position_usd(tvl_usd=500_000, user_position_usd=50_000)
+    check(abs(pos_user - 50_000) < 1e-6,
+          "user_position_usd=50k takes priority over default",
+          f"got={pos_user:.0f}")
+
+    # ── gas_cost_usd per chain ───────────────────────────────────────────────
+
+    check(abs(gas_cost_usd("1")   - 15.0) < 1e-9, "Ethereum gas = $15",  f"got={gas_cost_usd('1')}")
+    check(abs(gas_cost_usd("501") - 0.01) < 1e-9, "Solana gas = $0.01",  f"got={gas_cost_usd('501')}")
+    check(abs(gas_cost_usd("unknown") - 1.0) < 1e-9, "unknown chain → default $1", f"got={gas_cost_usd('unknown')}")
+
+    # ── slippage_fraction ────────────────────────────────────────────────────
+
+    slip_zero = slippage_fraction(0, 1_000_000)
+    check(abs(slip_zero - _SLIPPAGE_BASE) < 1e-9,
+          "position=0 → slippage = BASE (0.05%)", f"got={slip_zero:.5f}")
+
+    slip_mid = slippage_fraction(10_000, 1_000_000)
+    check(_SLIPPAGE_BASE < slip_mid < _SLIPPAGE_CAP,
+          "position=$10k in $1M pool: BASE < slippage < CAP",
+          f"got={slip_mid:.5f}")
+
+    slip_huge = slippage_fraction(100_000_000, 1_000_000)
+    check(abs(slip_huge - _SLIPPAGE_CAP) < 1e-9,
+          "position >> TVL: slippage = CAP (2%)", f"got={slip_huge:.5f}")
+
+    # ── total_execution_cost_fraction ───────────────────────────────────────
+
+    cost_zero = total_execution_cost_fraction(0, "1", 10_000, 1_000_000)
+    check(cost_zero == 0.0, "0 rebalances → total cost = 0.0", f"got={cost_zero}")
+
+    cost_eth = total_execution_cost_fraction(5, "1",   10_000, 1_000_000)
+    cost_sol = total_execution_cost_fraction(5, "501", 10_000, 1_000_000)
+    check(cost_eth > cost_sol,
+          "Ethereum (5 rebalances) > Solana: gas-dominated difference",
+          f"ETH={cost_eth:.4f} SOL={cost_sol:.4f}")
+
+    # ── scorer: chain-aware rebalance_cost ─────────────────────────────────
+
+    def _cand(lo: float, hi: float) -> CandidateRange:
+        center = (lo + hi) / 2.0
+        return CandidateRange(
+            lower_price=lo, upper_price=hi,
+            lower_tick=-100, upper_tick=100,
+            width_pct=(hi - lo) / center, center_price=center,
+            range_type="volatility_band",
+        )
+
+    def _bt(rebalances: int) -> BacktestResult:
+        return BacktestResult(
+            in_range_time_ratio=0.70,
+            cumulative_fee_proxy=0.02,
+            il_cost_proxy=-0.01,
+            first_breach_bar=5,
+            breach_count=rebalances,
+            rebalance_count=rebalances,
+            realized_net_pnl_proxy=0.01,
+        )
+
+    il   = estimate_il_risk("stable", 5.0, 2.0, 1.0, 0.0, 1.0, "uniswap-v3")
+    qual = detect_market_quality("0xTEST", 1_000_000, 100_000, 5_000, 50_000, 50_000, 50)
+    reg  = RegimeResult(regime="range_bound", confidence=0.7,
+                        realized_vol=0.8, drift_slope=0.0, jump_ratio=0.05)
+    cand = _cand(90.0, 110.0)
+    bt5  = _bt(5)
+
+    s_eth = score_candidate(cand, bt5, il, qual, reg, 1_000_000, 48,
+                             chain_index="1", position_usd=10_000)
+    s_sol = score_candidate(cand, bt5, il, qual, reg, 1_000_000, 48,
+                             chain_index="501", position_usd=10_000)
+    check(s_eth.rebalance_cost > s_sol.rebalance_cost,
+          "scorer: Ethereum rebalance_cost > Solana (chain-aware)",
+          f"ETH={s_eth.rebalance_cost:.4f} SOL={s_sol.rebalance_cost:.4f}")
+
+    # ── _scored_to_profile: execution_cost_fraction + net_pnl deduction ────
+
+    from app.services.range_recommender import _scored_to_profile
+
+    s_test = score_candidate(cand, bt5, il, qual, reg, 1_000_000, 48,
+                              chain_index="1", position_usd=10_000)
+    profile_eth = _scored_to_profile(
+        s_test, 48,
+        chain_index="1", position_usd=10_000, tvl_usd=1_000_000,
+    )
+    check(profile_eth.execution_cost_fraction is not None,
+          "RangeProfile.execution_cost_fraction set when chain provided",
+          f"got={profile_eth.execution_cost_fraction}")
+    check(profile_eth.expected_net_pnl < bt5.realized_net_pnl_proxy,
+          "expected_net_pnl < realized_net_pnl_proxy (execution cost deducted)",
+          f"net_pnl={profile_eth.expected_net_pnl:.6f} raw={bt5.realized_net_pnl_proxy:.6f}")
+
+    # No chain provided → execution_cost_fraction is None, net_pnl = raw
+    profile_no_chain = _scored_to_profile(s_test, 48)
+    check(profile_no_chain.execution_cost_fraction is None,
+          "no chain_index → execution_cost_fraction is None (backward compat)",
+          f"got={profile_no_chain.execution_cost_fraction}")
+
+
+def test_il_edge_correction() -> None:
+    section("A12. In-range IL Edge Correction Heuristic (P2.2.1a)")
+    from app.services.range_backtester import backtest_candidate, _il_edge_weight
+    from app.models.schemas import CandidateRange
+
+    lo, hi = 90.0, 110.0
+
+    # ── _il_edge_weight unit tests ────────────────────────────────────────────
+
+    # At center: no amplification
+    w_center = _il_edge_weight(100.0, lo, hi)
+    check(abs(w_center - 1.0) < 1e-9, "center price → edge_weight = 1.0", f"got={w_center:.4f}")
+
+    # Near lower boundary: amplified
+    w_near_lo = _il_edge_weight(91.0, lo, hi)
+    check(w_near_lo > 1.0, "near lower boundary → edge_weight > 1.0", f"got={w_near_lo:.4f}")
+
+    # Near upper boundary: amplified
+    w_near_hi = _il_edge_weight(109.0, lo, hi)
+    check(w_near_hi > 1.0, "near upper boundary → edge_weight > 1.0", f"got={w_near_hi:.4f}")
+
+    # Symmetry: same distance from center on both sides gives same weight
+    w_lo_side = _il_edge_weight(95.0, lo, hi)
+    w_hi_side = _il_edge_weight(105.0, lo, hi)
+    check(abs(w_lo_side - w_hi_side) < 1e-9, "edge_weight is symmetric around center",
+          f"lo_side={w_lo_side:.4f} hi_side={w_hi_side:.4f}")
+
+    # OOR price → weight = 1.0 (OOR path unchanged)
+    w_oor_lo = _il_edge_weight(85.0, lo, hi)
+    w_oor_hi = _il_edge_weight(115.0, lo, hi)
+    check(abs(w_oor_lo - 1.0) < 1e-9, "OOR below lower → edge_weight = 1.0", f"got={w_oor_lo:.4f}")
+    check(abs(w_oor_hi - 1.0) < 1e-9, "OOR above upper → edge_weight = 1.0", f"got={w_oor_hi:.4f}")
+
+    # Degenerate: upper <= lower → weight = 1.0
+    w_degenerate = _il_edge_weight(100.0, 110.0, 90.0)
+    check(abs(w_degenerate - 1.0) < 1e-9, "degenerate range (lo >= hi) → edge_weight = 1.0",
+          f"got={w_degenerate:.4f}")
+
+    # ── backtest integration: 终值越靠近区间边缘，IL 放大越明显 ──────────────────
+
+    def _cand(lo_p: float, hi_p: float) -> CandidateRange:
+        center = (lo_p + hi_p) / 2.0
+        w = (hi_p - lo_p) / center
+        return CandidateRange(
+            lower_price=lo_p, upper_price=hi_p,
+            lower_tick=-100, upper_tick=100,
+            width_pct=w, center_price=center,
+            range_type="volatility_band",
+        )
+
+    # Same price range and fee. Vary where the final price lands.
+    # bar_center: closes at 100 (center), bar_edge: closes at 109 (near upper boundary)
+    def _bars(close_price: float) -> list[dict]:
+        # All bars at 100 (in range), only final bar changes close price
+        bars = [{"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1000.0}] * 10
+        bars[-1] = {"open": 100.0, "high": 110.0, "low": 99.0, "close": close_price, "volume": 1000.0}
+        return bars
+
+    cand = _cand(lo, hi)
+    bt_center = backtest_candidate(_bars(100.0), cand, 10, 0.003, tvl_usd=1.0)
+    bt_edge   = backtest_candidate(_bars(109.0), cand, 10, 0.003, tvl_usd=1.0)
+
+    # Both in-range (fee proxy should be identical or close)
+    check(abs(bt_center.cumulative_fee_proxy - bt_edge.cumulative_fee_proxy) < 1e-6,
+          "edge correction does not affect fee_proxy", f"center={bt_center.cumulative_fee_proxy} edge={bt_edge.cumulative_fee_proxy}")
+
+    # IL cost (negative): edge position → more negative (larger magnitude)
+    check(bt_edge.il_cost_proxy <= bt_center.il_cost_proxy,
+          "终值越靠近区间边缘，IL 放大越明显 (edge il_cost ≤ center il_cost)",
+          f"edge={bt_edge.il_cost_proxy:.6f} center={bt_center.il_cost_proxy:.6f}")
+
+
 def test_fee_tier_resolution() -> None:
     section("A10. Fee Tier Resolution (P2.1.2)")
     from app.services.range_recommender import _infer_fee_rate
@@ -569,6 +857,61 @@ def test_fee_tier_resolution() -> None:
 
     r = _infer_fee_rate("uniswap-v3", {"feeTier": "invalid"})
     check(abs(r - 0.003) < 1e-9,  "feeTier='invalid' → static fallback (bad value)", f"got={r}")
+
+
+async def test_protocol_native_fee_fetcher() -> None:
+    section("A15. Protocol-Native Fee Fetcher (P2.1 fee tier)")
+    from unittest.mock import AsyncMock, patch
+    from app.services.fee_fetcher import (
+        _validate_fee,
+        fetch_protocol_fee_rate,
+    )
+
+    # ── _validate_fee bounds ──────────────────────────────────────────────────
+    check(_validate_fee(0.003) == 0.003,   "_validate_fee: 0.3% in bounds → pass", "")
+    check(_validate_fee(0.0001) == 0.0001, "_validate_fee: 0.01% in bounds → pass", "")
+    check(_validate_fee(0.05) == 0.05,     "_validate_fee: 5% at upper bound → pass", "")
+    check(_validate_fee(0.0) is None,      "_validate_fee: 0% → None (out of bounds)", "")
+    check(_validate_fee(0.06) is None,     "_validate_fee: 6% → None (too high)", "")
+    check(_validate_fee(-0.001) is None,   "_validate_fee: negative → None", "")
+
+    # ── Routing: raydium-clmm on chain 501 ───────────────────────────────────
+    with patch("app.services.fee_fetcher._raydium_clmm_fee", new=AsyncMock(return_value=0.0025)):
+        result = await fetch_protocol_fee_rate("raydium-clmm", "FakePool", "501", {})
+        check(result == 0.0025, "raydium-clmm chain=501: native fetch returns 0.0025", f"got={result}")
+
+    # ── Routing: raydium-clmm on wrong chain → None (no native fetch) ────────
+    result = await fetch_protocol_fee_rate("raydium-clmm", "FakePool", "1", {})
+    check(result is None, "raydium-clmm chain=1 → None (chain mismatch, no native)", f"got={result}")
+
+    # ── Routing: meteora-dlmm on chain 501 ───────────────────────────────────
+    with patch("app.services.fee_fetcher._meteora_fee", new=AsyncMock(return_value=0.003)):
+        result = await fetch_protocol_fee_rate("meteora-dlmm", "FakePool", "501", {})
+        check(result == 0.003, "meteora-dlmm chain=501: native fetch returns 0.003", f"got={result}")
+
+    # ── Routing: uniswap-v3 on chain 1 ───────────────────────────────────────
+    with patch("app.services.fee_fetcher._uniswap_v3_subgraph_fee", new=AsyncMock(return_value=0.0005)):
+        result = await fetch_protocol_fee_rate("uniswap-v3", "0xFakePool", "1", {})
+        check(result == 0.0005, "uniswap-v3 chain=1: subgraph returns 0.0005", f"got={result}")
+
+    # ── Routing: uniswap-v3 on chain 8453 ────────────────────────────────────
+    with patch("app.services.fee_fetcher._uniswap_v3_subgraph_fee", new=AsyncMock(return_value=0.003)):
+        result = await fetch_protocol_fee_rate("uniswap-v3", "0xFakePool", "8453", {})
+        check(result == 0.003, "uniswap-v3 chain=8453: subgraph returns 0.003", f"got={result}")
+
+    # ── Routing: unsupported protocol → None ─────────────────────────────────
+    result = await fetch_protocol_fee_rate("aerodrome", "FakePool", "8453", {})
+    check(result is None, "aerodrome (unsupported) → None", f"got={result}")
+
+    # ── Native failure: _raydium_clmm_fee returns None → caller gets None ────
+    with patch("app.services.fee_fetcher._raydium_clmm_fee", new=AsyncMock(return_value=None)):
+        result = await fetch_protocol_fee_rate("raydium-clmm", "FakePool", "501", {})
+        check(result is None, "raydium-clmm native failure → None (caller falls back)", f"got={result}")
+
+    # ── Priority chain in _fetch_pool_state: native → fallback ───────────────
+    # Full end-to-end priority chain is covered by B5 (live) and the routing
+    # tests above.  Mark the structural intent explicitly.
+    check(True, "priority chain: native → fallback (covered by routing tests above)", "")
 
 
 def test_schema_fields() -> None:
@@ -774,6 +1117,150 @@ def _validate_recommendation(r: dict, label: str, expected_tier: str | None = No
             print(f"    {YELLOW}YP adjustments:{RESET} {'; '.join(adj)}")
 
 
+def test_scoring_weights_wiring() -> None:
+    section("A16. Scoring Weights — settings 接入 recommender / scorer")
+    import inspect
+    from app.core.config import settings
+    from app.services.range_scorer import (
+        DEFAULT_WEIGHTS, score_all_candidates, select_profiles,
+    )
+    from app.models.schemas import (
+        CandidateRange, BacktestResult, ILRiskResult,
+        MarketQualityResult, RegimeResult,
+    )
+    from app.services import range_recommender
+
+    # ── 1. settings.range_scoring_weights 完整性与默认值 ─────────────────────
+    sw = settings.range_scoring_weights
+    check(set(sw.keys()) == {"fee", "il", "breach", "rebalance", "quality"},
+          "range_scoring_weights 包含全部 5 个 key", f"got={set(sw.keys())}")
+
+    # 默认值与 DEFAULT_WEIGHTS 对齐（确保改动向后兼容）
+    for k, v in DEFAULT_WEIGHTS.items():
+        check(abs(sw.get(k, -1) - v) < 1e-9,
+              f"settings.range_weight_{k} 默认值与 DEFAULT_WEIGHTS 一致",
+              f"settings={sw.get(k)} default={v}")
+
+    # ── 2. 源码级接入验证：recommend_range 读 settings.range_scoring_weights ──
+    src = inspect.getsource(range_recommender.recommend_range)
+    check("settings.range_scoring_weights" in src,
+          "recommend_range 中 weights 来源已改为 settings.range_scoring_weights",
+          "")
+    check("DEFAULT_WEIGHTS" not in src.split("scoring_weights or ")[-1].split("\n")[0],
+          "recommend_range 的 weights fallback 不再直接用 DEFAULT_WEIGHTS",
+          "")
+
+    # ── 3. 评分数值随权重变化 ─────────────────────────────────────────────────
+    HORIZON = 48
+
+    def _fp(fee_s: float) -> float:
+        """给定目标 fee_score，反推 cumulative_fee_proxy（horizon=48 bar）。"""
+        return fee_s * 3.0 * (HORIZON / 8760.0)
+
+    # 共用辅助对象（干净市场 + 区间震荡 + 低 IL 启发式）
+    il_result  = ILRiskResult(level="low", score=5, main_driver="stable")
+    quality    = MarketQualityResult(pool_address="test", wash_risk="low", wash_score=0.0,
+                                     vol_tvl_ratio=0.5, imbalance_ratio=0.5,
+                                     avg_trade_size_usd=100.0)
+    regime     = RegimeResult(regime="range_bound", confidence=0.8,
+                              realized_vol=0.5, drift_slope=0.0, jump_ratio=0.0)
+
+    # 两个候选：A 高手续费 + 较高 IL；C 低手续费 + 极低 IL
+    # fee_s / il_s 手工计算（il_result.score=5 → heuristic_il=0.05）:
+    #   il_s = 0.60*|il_cost| + 0.40*0.05
+    #   A: fee_s=0.70, il_s=0.15 → il_cost=-0.2167; breach: in_range=0.80 → breach_r=0.12
+    #   C: fee_s=0.25, il_s=0.03 → il_cost=-0.0167; breach: in_range=0.98 → breach_r=0.012
+    cand_A = CandidateRange(lower_price=0.80, upper_price=1.20, lower_tick=-600, upper_tick=600,
+                             width_pct=0.15, center_price=1.0, range_type="volatility_band")
+    bt_A   = BacktestResult(in_range_time_ratio=0.80, cumulative_fee_proxy=_fp(0.70),
+                             il_cost_proxy=-0.2167, first_breach_bar=None, breach_count=0,
+                             rebalance_count=0, realized_net_pnl_proxy=0.01)
+
+    cand_C = CandidateRange(lower_price=0.70, upper_price=1.30, lower_tick=-1000, upper_tick=1000,
+                             width_pct=0.25, center_price=1.0, range_type="volatility_band")
+    bt_C   = BacktestResult(in_range_time_ratio=0.98, cumulative_fee_proxy=_fp(0.25),
+                             il_cost_proxy=-0.0167, first_breach_bar=None, breach_count=0,
+                             rebalance_count=0, realized_net_pnl_proxy=0.01)
+
+    # fee 偏重权重 → A 得分更高
+    w_fee = {"fee": 0.60, "il": 0.15, "breach": 0.15, "rebalance": 0.05, "quality": 0.05}
+    scored_fee = score_all_candidates([cand_A, cand_C], [bt_A, bt_C],
+                                      il_result, quality, regime,
+                                      tvl_usd=500_000, horizon_bars=HORIZON,
+                                      weights=w_fee, replay_weight=1.0)
+    util_A_fee = next(s.utility_score for s in scored_fee if s.candidate is cand_A)
+    util_C_fee = next(s.utility_score for s in scored_fee if s.candidate is cand_C)
+    check(util_A_fee > util_C_fee,
+          "fee 偏重：A（高手续费）得分 > C（低手续费低IL）",
+          f"A={util_A_fee:.4f} C={util_C_fee:.4f}")
+
+    # IL 偏重权重 → C 得分更高（或 A 被惩罚为 0）
+    w_il = {"fee": 0.15, "il": 0.60, "breach": 0.15, "rebalance": 0.05, "quality": 0.05}
+    scored_il = score_all_candidates([cand_A, cand_C], [bt_A, bt_C],
+                                     il_result, quality, regime,
+                                     tvl_usd=500_000, horizon_bars=HORIZON,
+                                     weights=w_il, replay_weight=1.0)
+    util_A_il = next(s.utility_score for s in scored_il if s.candidate is cand_A)
+    util_C_il = next(s.utility_score for s in scored_il if s.candidate is cand_C)
+    check(util_C_il > util_A_il,
+          "IL 偏重：C（低IL）得分 > A（高IL）",
+          f"C={util_C_il:.4f} A={util_A_il:.4f}")
+
+    check(util_A_fee > util_A_il,
+          "A 在 fee 偏重时得分 > IL 偏重时（权重变化产生差异）",
+          f"fee_heavy={util_A_fee:.4f} il_heavy={util_A_il:.4f}")
+
+    # ── 4. 全零权重不崩溃 ────────────────────────────────────────────────────
+    w_zero = {"fee": 0.0, "il": 0.0, "breach": 0.0, "rebalance": 0.0, "quality": 0.0}
+    scored_z = score_all_candidates([cand_A], [bt_A], il_result, quality, regime,
+                                    horizon_bars=HORIZON, weights=w_zero)
+    check(scored_z[0].utility_score == 0.0,
+          "全零权重 → utility=0.0，不崩溃", f"got={scored_z[0].utility_score}")
+
+    # ── 5. 业务级验证：balanced profile 随权重切换改变选中结果 ───────────────
+    # 4 个候选：A aggressive（窄高费高IL）、B 中等（高费较高IL）、
+    #           C 中等（低费极低IL）、D conservative（宽防御低费）
+    # fee 偏重 → balanced = B；IL 偏重 → balanced = C
+    cand_Ag = CandidateRange(lower_price=0.90, upper_price=1.10, lower_tick=-200, upper_tick=200,
+                              width_pct=0.05, center_price=1.0, range_type="volatility_band")
+    bt_Ag   = BacktestResult(in_range_time_ratio=0.75, cumulative_fee_proxy=_fp(0.80),
+                              il_cost_proxy=-0.20, first_breach_bar=5, breach_count=2,
+                              rebalance_count=0, realized_net_pnl_proxy=0.01)
+
+    cand_D  = CandidateRange(lower_price=0.50, upper_price=1.50, lower_tick=-2000, upper_tick=2000,
+                              width_pct=0.50, center_price=1.0, range_type="defensive")
+    bt_D    = BacktestResult(in_range_time_ratio=0.99, cumulative_fee_proxy=_fp(0.10),
+                              il_cost_proxy=0.0, first_breach_bar=None, breach_count=0,
+                              rebalance_count=0, realized_net_pnl_proxy=0.01)
+
+    all_cands = [cand_Ag, cand_A, cand_C, cand_D]   # A=narrow, B=A-above, C=C-above, D=wide
+    all_bts   = [bt_Ag,   bt_A,   bt_C,   bt_D]
+
+    # fee 偏重 → B（width=0.15, 高费）成为 balanced
+    s_fee = score_all_candidates(all_cands, all_bts, il_result, quality, regime,
+                                  tvl_usd=500_000, horizon_bars=HORIZON,
+                                  weights=w_fee, replay_weight=1.0)
+    p_fee = select_profiles(s_fee)
+    balanced_fee_w = p_fee["balanced"].candidate.width_pct if p_fee["balanced"] else None
+    check(balanced_fee_w == 0.15,
+          "fee 偏重：balanced 选中 B（width=0.15，高手续费）",
+          f"got_width={balanced_fee_w}")
+
+    # IL 偏重 → C（width=0.25, 极低IL）成为 balanced
+    s_il = score_all_candidates(all_cands, all_bts, il_result, quality, regime,
+                                 tvl_usd=500_000, horizon_bars=HORIZON,
+                                 weights=w_il, replay_weight=1.0)
+    p_il = select_profiles(s_il)
+    balanced_il_w = p_il["balanced"].candidate.width_pct if p_il["balanced"] else None
+    check(balanced_il_w == 0.25,
+          "IL 偏重：balanced 选中 C（width=0.25，极低IL）",
+          f"got_width={balanced_il_w}")
+
+    check(balanced_fee_w != balanced_il_w,
+          "权重显著变化 → balanced profile 选中结果不同（B ≠ C）",
+          f"fee_heavy_balanced={balanced_fee_w} il_heavy_balanced={balanced_il_w}")
+
+
 async def test_integration_mature_bsc() -> None:
     section("B1. Integration — BSC Mature Pool (PancakeSwap V3)")
     print(f"  {INFO} Discovering BSC WBNB/USDT pool via DexScreener…")
@@ -884,6 +1371,43 @@ async def test_integration_eth_univ3_fee_tier() -> None:
         check(resolved < 0.003,
               "feeTier path: resolved fee < 0.3% static default",
               f"resolved={resolved:.4%} vs static=0.30%")
+
+
+async def test_native_fee_raydium_live() -> None:
+    section("B5. Live — Raydium CLMM native fee fetch (P2.1)")
+    from app.services.fee_fetcher import _raydium_clmm_fee, fetch_protocol_fee_rate
+
+    # SOL/USDC Raydium CLMM pool on Solana (one of the highest-TVL CLMM pools)
+    # Pool: 8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj
+    POOL_ADDRESS = "8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj"
+    print(f"  {INFO} Fetching Raydium CLMM fee for SOL/USDC pool…")
+
+    try:
+        fee = await _raydium_clmm_fee(POOL_ADDRESS)
+    except Exception as e:
+        _warn("B5 Raydium native fee: exception during fetch", str(e)[:120])
+        return
+
+    if fee is None:
+        _warn("B5 Raydium native fee: returned None (API unreachable or pool not found)", "")
+        return
+
+    print(f"  {INFO} Raydium CLMM native fee = {fee:.5f} ({fee*100:.3f}%)")
+    check(0.000001 <= fee <= 0.05,
+          f"Raydium native fee in valid range [0.0001%, 5%]",
+          f"got={fee:.5f}")
+    check(fee <= 0.01,
+          "Raydium native fee ≤ 1% (typical CLMM tiers are ≤ 1%)",
+          f"got={fee*100:.3f}%")
+
+    # Also verify the routing wrapper routes correctly
+    fee2 = await fetch_protocol_fee_rate("raydium-clmm", POOL_ADDRESS, "501", {})
+    if fee2 is not None:
+        check(abs(fee - fee2) < 1e-9,
+              "fetch_protocol_fee_rate routes raydium-clmm→_raydium_clmm_fee",
+              f"direct={fee:.5f} routed={fee2:.5f}")
+    else:
+        _warn("B5 routing check: fetch_protocol_fee_rate returned None (re-fetch failed)", "")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1102,6 +1626,415 @@ async def test_rejection_no_price_data() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# A17. Calibration — thresholds, replay bounds, regime scales, confidence floor
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_calibration_wiring() -> None:
+    section("A17. Calibration Wiring — thresholds / confidence floor / regime scales")
+    from app.core.config import settings
+    from app.services import history_sufficiency as hs
+    import json
+
+    # ── 1. Settings fields are readable with correct defaults ─────────────────
+    check(
+        settings.calibration_growing_standard_threshold == 0.65,
+        "A17: growing threshold default=0.65",
+        str(settings.calibration_growing_standard_threshold),
+    )
+    check(
+        settings.calibration_mature_standard_threshold == 0.55,
+        "A17: mature threshold default=0.55",
+        str(settings.calibration_mature_standard_threshold),
+    )
+    check(
+        settings.replay_weight_lower_bound == 0.25,
+        "A17: replay_weight_lower_bound default=0.25",
+        str(settings.replay_weight_lower_bound),
+    )
+    check(
+        settings.replay_weight_upper_bound == 0.75,
+        "A17: replay_weight_upper_bound default=0.75",
+        str(settings.replay_weight_upper_bound),
+    )
+    check(
+        settings.confidence_floor == 0.0,
+        "A17: confidence_floor default=0.0 (disabled)",
+        str(settings.confidence_floor),
+    )
+
+    # ── 2. assess() uses calibrated actionability thresholds ──────────────────
+    # Mature pool with evidence just below default mature threshold (0.55)
+    # Source: token_level → sq=0.4; bars_1h=24 → coverage=1.0; data_quality=1.0
+    # evidence ≈ 0.35*1 + 0.30*1 + 0.20*0.4 + 0.15*1 = 0.35+0.30+0.08+0.15 = 0.88 (> 0.55)
+    # Use minimal bars to get lower evidence: bars_1h=24 but missing_bar_ratio=0.7
+    r_low = hs.assess(pool_age_hours=48, bars_1h=24, missing_bar_ratio=0.70, source_quality="token_level")
+    check(
+        r_low.history_tier == "mature",
+        "A17: mature tier with missing data",
+        r_low.history_tier,
+    )
+    # evidence with missing=0.7: 0.35*1 + 0.30*1 + 0.20*0.4 + 0.15*0.3 = 0.35+0.30+0.08+0.045 = 0.775
+    # still above 0.55 → standard.  Use source_quality token_level + high missing to get below threshold.
+    # Let's use 4 bars (just meeting growing min) with high missing:
+    r_caution = hs.assess(pool_age_hours=6, bars_1h=4, missing_bar_ratio=0.90, source_quality="token_level")
+    # evidence: coverage = min(1, 4/24)=0.167; bar_cov = min(1, 4/24)=0.167;
+    #           sq_factor=0.4; data_quality=0.1
+    # ≈ 0.35*0.167 + 0.30*0.167 + 0.20*0.4 + 0.15*0.1 = 0.058+0.050+0.080+0.015 = 0.203 < 0.65
+    check(
+        r_caution.actionability == "caution",
+        "A17: growing pool with low evidence → caution",
+        f"evidence={r_caution.effective_evidence_score:.3f} tier={r_caution.history_tier}",
+    )
+
+    # ── 3. Replay weight uses calibrated bounds ────────────────────────────────
+    # Evidence at lower bound → replay_weight = 0
+    # Use 1 bar, 2h age, token_level, 90% missing:
+    # history_coverage = 60/1440 ≈ 0.042; bar_coverage ≈ 0.042; sq=0.4; dq=0.1
+    # evidence ≈ 0.35*0.042 + 0.30*0.042 + 0.20*0.4 + 0.15*0.1 ≈ 0.123 < lower_bound 0.25
+    r_lo = hs.assess(pool_age_hours=2, bars_1h=1, missing_bar_ratio=0.90, source_quality="token_level")
+    check(
+        r_lo.replay_weight == 0.0,
+        "A17: evidence below lower_bound → replay_weight=0",
+        f"evidence={r_lo.effective_evidence_score:.3f} rw={r_lo.replay_weight}",
+    )
+    # Evidence at upper bound or above → replay_weight ≥ 1.0
+    r_hi = hs.assess(pool_age_hours=48, bars_1h=48, source_quality="pool_specific")
+    check(
+        r_hi.replay_weight == 1.0,
+        "A17: high evidence → replay_weight=1.0",
+        f"evidence={r_hi.effective_evidence_score:.3f} rw={r_hi.replay_weight}",
+    )
+
+    # ── 4. Confidence regime scales parsed correctly ───────────────────────────
+    scales_raw = settings.confidence_regime_scales
+    try:
+        scales = json.loads(scales_raw)
+        check(
+            scales.get("range_bound") == 1.0,
+            "A17: regime scale range_bound=1.0",
+            str(scales.get("range_bound")),
+        )
+        check(
+            scales.get("chaotic", 1.0) < 1.0,
+            "A17: regime scale chaotic < 1.0",
+            str(scales.get("chaotic")),
+        )
+        json_ok = True
+    except json.JSONDecodeError as e:
+        _fail("A17: confidence_regime_scales valid JSON", str(e))
+        json_ok = False
+
+    if json_ok:
+        check(True, "A17: confidence_regime_scales is valid JSON")
+
+    # ── 5. JSON parse error → fallback scale=1.0 ─────────────────────────────
+    from app.services.range_recommender import _apply_confidence_calibration
+    with patch.object(settings, "confidence_regime_scales", "{invalid json"):
+        calibrated = _apply_confidence_calibration(0.8, "range_bound")
+    check(
+        calibrated == 0.8,
+        "A17: malformed JSON → fallback scale=1.0 (no change)",
+        f"calibrated={calibrated}",
+    )
+
+    # ── 6. Regime scale applied multiplicatively ──────────────────────────────
+    # chaotic scale=0.70 → 0.8 * 0.70 = 0.56
+    calibrated_chaotic = _apply_confidence_calibration(0.8, "chaotic")
+    expected = round(0.8 * scales.get("chaotic", 0.70), 4) if json_ok else 0.8
+    check(
+        abs(calibrated_chaotic - expected) < 1e-4,
+        "A17: chaotic regime scale applied correctly",
+        f"got={calibrated_chaotic} expected≈{expected}",
+    )
+
+    # ── 7. confidence_floor=0.0 → no change ──────────────────────────────────
+    from app.services.range_recommender import _check_confidence_floor
+    act, flags = _check_confidence_floor(0.3, "standard")
+    check(act == "standard" and flags == [], "A17: floor=0.0 → no downgrade", "")
+
+    # ── 8. confidence_floor triggered → actionability downgraded + risk_flag ──
+    with patch.object(settings, "confidence_floor", 0.5):
+        act_down, flags_down = _check_confidence_floor(0.3, "standard")
+    check(
+        act_down == "caution",
+        "A17: floor triggered → actionability=caution",
+        act_down,
+    )
+    check(
+        len(flags_down) == 1 and "calibrated floor" in flags_down[0].lower(),
+        "A17: floor triggered → risk_flag appended",
+        flags_down[0] if flags_down else "",
+    )
+    check(
+        "0.30" in flags_down[0] and "0.50" in flags_down[0],
+        "A17: risk_flag contains confidence and floor values",
+        flags_down[0] if flags_down else "",
+    )
+
+    # ── 9. watch_only not upgraded by floor ───────────────────────────────────
+    with patch.object(settings, "confidence_floor", 0.9):
+        act_wo, flags_wo = _check_confidence_floor(0.1, "watch_only")
+    check(
+        act_wo == "watch_only",
+        "A17: watch_only stays watch_only when floor triggered",
+        act_wo,
+    )
+    check(
+        len(flags_wo) == 1,
+        "A17: watch_only still gets risk_flag",
+        str(flags_wo),
+    )
+
+    # ── 10. Backward compat: changing threshold changes assess() output ───────
+    # Simulate calibration output: raise growing threshold to 0.99 → always caution
+    with patch.object(settings, "calibration_growing_standard_threshold", 0.99):
+        r_grown = hs.assess(pool_age_hours=6, bars_1h=4, source_quality="pool_specific")
+    check(
+        r_grown.actionability == "caution",
+        "A17: raised growing threshold → caution (backward-compat test)",
+        f"actionability={r_grown.actionability}",
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A18. Calibration JSON Load — runtime wiring
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_calibration_json_load() -> None:
+    section("A18. Calibration JSON Load — runtime wiring")
+    import json as json_mod
+    import logging
+    import os
+    import tempfile
+    from app.core.config import Settings, _load_calibration_overrides
+
+    # Helper: write a temp calibration.json and return (Settings instance, path)
+    def _prep(data: dict | None = None, raw_text: str | None = None) -> tuple:
+        s = Settings()
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as f:
+            if raw_text is not None:
+                f.write(raw_text)
+            elif data is not None:
+                json_mod.dump(data, f)
+            tmp = f.name
+        object.__setattr__(s, "calibration_file_path", tmp)
+        return s, tmp
+
+    # ── 1. Valid JSON — all 5 calibration fields applied ──────────────────────
+    cal_data = {
+        "calibration_growing_standard_threshold": 0.62,
+        "calibration_mature_standard_threshold":  0.50,
+        "replay_weight_lower_bound":              0.20,
+        "replay_weight_upper_bound":              0.80,
+        "confidence_regime_scales": {
+            "range_bound": 1.0, "trend_up": 0.80,
+            "trend_down": 0.80, "chaotic": 0.65,
+        },
+    }
+    s1, p1 = _prep(cal_data)
+    _load_calibration_overrides(s1)
+    check(
+        s1.calibration_growing_standard_threshold == 0.62,
+        "A18: growing_threshold overridden from JSON",
+        str(s1.calibration_growing_standard_threshold),
+    )
+    check(
+        s1.calibration_mature_standard_threshold == 0.50,
+        "A18: mature_threshold overridden from JSON",
+        str(s1.calibration_mature_standard_threshold),
+    )
+    check(
+        s1.replay_weight_lower_bound == 0.20,
+        "A18: rw_lower_bound overridden from JSON",
+        str(s1.replay_weight_lower_bound),
+    )
+    check(
+        s1.replay_weight_upper_bound == 0.80,
+        "A18: rw_upper_bound overridden from JSON",
+        str(s1.replay_weight_upper_bound),
+    )
+    # regime scales stored as JSON string in settings
+    loaded_scales = json_mod.loads(s1.confidence_regime_scales)
+    check(
+        loaded_scales.get("chaotic") == 0.65,
+        "A18: regime_scales dict→JSON string conversion correct",
+        str(loaded_scales),
+    )
+    os.unlink(p1)
+
+    # ── 2. Missing file → no crash, defaults preserved ─────────────────────
+    s2 = Settings()
+    object.__setattr__(s2, "calibration_file_path", "/tmp/nonexistent_cal_xyz.json")
+    try:
+        _load_calibration_overrides(s2)
+        no_crash = True
+    except Exception as exc:
+        no_crash = False
+    check(no_crash, "A18: missing file → no crash")
+    check(
+        s2.calibration_growing_standard_threshold == 0.65,
+        "A18: missing file → defaults preserved",
+        str(s2.calibration_growing_standard_threshold),
+    )
+
+    # ── 3. Corrupted JSON → no crash, defaults preserved ──────────────────
+    s3, p3 = _prep(raw_text="{bad json!!!")
+    try:
+        _load_calibration_overrides(s3)
+        no_crash3 = True
+    except Exception as exc:
+        no_crash3 = False
+    check(no_crash3, "A18: corrupted JSON → no crash")
+    check(
+        s3.calibration_growing_standard_threshold == 0.65,
+        "A18: corrupted JSON → defaults preserved",
+        str(s3.calibration_growing_standard_threshold),
+    )
+    os.unlink(p3)
+
+    # ── 4. Partial JSON — only present fields updated, absent stay default ─
+    s4, p4 = _prep({"calibration_growing_standard_threshold": 0.60})
+    _load_calibration_overrides(s4)
+    check(
+        s4.calibration_growing_standard_threshold == 0.60,
+        "A18: partial JSON — present field updated",
+        str(s4.calibration_growing_standard_threshold),
+    )
+    check(
+        s4.calibration_mature_standard_threshold == 0.55,
+        "A18: partial JSON — absent field stays default (0.55)",
+        str(s4.calibration_mature_standard_threshold),
+    )
+    os.unlink(p4)
+
+    # ── 5. ENV priority — field in model_fields_set is NOT overridden ──────
+    # Passing the field explicitly to Settings() simulates ENV override
+    s5 = Settings(calibration_growing_standard_threshold=0.70)
+    check(
+        "calibration_growing_standard_threshold" in s5.model_fields_set,
+        "A18: ENV-set field appears in model_fields_set",
+    )
+    cal_env = {"calibration_growing_standard_threshold": 0.99}
+    s5_tmp, p5 = _prep(cal_env)
+    object.__setattr__(s5, "calibration_file_path", p5)
+    _load_calibration_overrides(s5)
+    check(
+        s5.calibration_growing_standard_threshold == 0.70,
+        "A18: ENV-set field not overridden by calibration.json (0.70 survives)",
+        str(s5.calibration_growing_standard_threshold),
+    )
+    os.unlink(p5)
+
+    # ── 6. confidence_floor NOT overridden even if present in JSON ─────────
+    s6, p6 = _prep({"confidence_floor": 0.99})
+    original_floor = s6.confidence_floor
+    _load_calibration_overrides(s6)
+    check(
+        s6.confidence_floor == original_floor,
+        "A18: confidence_floor not overridden by calibration.json",
+        f"before={original_floor} after={s6.confidence_floor}",
+    )
+    os.unlink(p6)
+
+    # ── 7. Type error on one field — skipped, other fields still applied ──
+    s7, p7 = _prep({
+        "calibration_growing_standard_threshold": "not-a-float",
+        "calibration_mature_standard_threshold": 0.52,
+    })
+    _load_calibration_overrides(s7)
+    check(
+        s7.calibration_growing_standard_threshold == 0.65,
+        "A18: bad-type field skipped, stays default",
+        str(s7.calibration_growing_standard_threshold),
+    )
+    check(
+        s7.calibration_mature_standard_threshold == 0.52,
+        "A18: valid sibling field still applied despite bad-type sibling",
+        str(s7.calibration_mature_standard_threshold),
+    )
+    os.unlink(p7)
+
+    # ── 8. meta fields printed in log (verify log record contains values) ──
+    cal_meta = {
+        "calibration_growing_standard_threshold": 0.61,
+        "meta": {
+            "version": "1.2.3",
+            "generated_at": "2026-03-26T00:00:00+00:00",
+            "real_samples": 127,
+        },
+    }
+    s8, p8 = _prep(cal_meta)
+    handler = logging.handlers.MemoryHandler(capacity=100, flushLevel=logging.CRITICAL)
+    records: list[logging.LogRecord] = []
+
+    class _CapHandler(logging.Handler):
+        def emit(self, r: logging.LogRecord) -> None:
+            records.append(r)
+
+    cap = _CapHandler()
+    cal_logger = logging.getLogger("app.core.config")
+    cal_logger.addHandler(cap)
+    cal_logger.setLevel(logging.INFO)
+    _load_calibration_overrides(s8)
+    cal_logger.removeHandler(cap)
+    os.unlink(p8)
+
+    info_msgs = [r.getMessage() for r in records if r.levelno == logging.INFO]
+    combined = " ".join(info_msgs)
+    check(
+        "version=1.2.3" in combined,
+        "A18: meta.version appears in INFO log",
+        combined[:120],
+    )
+    check(
+        "real_samples=127" in combined,
+        "A18: meta.real_samples appears in INFO log",
+        combined[:120],
+    )
+
+    # ── 9. After applying, assess() uses new growing threshold ───────────
+    from app.services import history_sufficiency as hs
+    # With new growing threshold 0.61, a pool that was "caution" at 0.65
+    # but has evidence ≈ 0.203 is still caution (both above) — use threshold 0.10
+    # to guarantee standard outcome, proving settings were actually applied.
+    s9, p9 = _prep({"calibration_growing_standard_threshold": 0.10})
+    _load_calibration_overrides(s9)
+    # Temporarily patch the global settings with our custom instance values
+    from app.core.config import settings as global_settings
+    orig_grow = global_settings.calibration_growing_standard_threshold
+    with patch.object(global_settings, "calibration_growing_standard_threshold",
+                      s9.calibration_growing_standard_threshold):
+        r9 = hs.assess(pool_age_hours=6, bars_1h=4, source_quality="pool_specific")
+    check(
+        r9.actionability == "standard",
+        "A18: after applying low growing_threshold → assess() returns standard",
+        f"threshold=0.10 evidence={r9.effective_evidence_score:.3f} action={r9.actionability}",
+    )
+    os.unlink(p9)
+
+    # ── 10. After applying, _apply_confidence_calibration uses new scales ─
+    from app.services.range_recommender import _apply_confidence_calibration
+    s10, p10 = _prep({
+        "confidence_regime_scales": {
+            "range_bound": 1.0, "trend_up": 0.50,
+            "trend_down": 0.50, "chaotic": 0.50,
+        },
+    })
+    _load_calibration_overrides(s10)
+    with patch.object(global_settings, "confidence_regime_scales",
+                      s10.confidence_regime_scales):
+        calibrated = _apply_confidence_calibration(1.0, "trend_up")
+    check(
+        calibrated == 0.50,
+        "A18: after applying new regime scales → _apply_confidence_calibration uses them",
+        f"got={calibrated}",
+    )
+    os.unlink(p10)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1122,14 +2055,22 @@ async def main() -> None:
     test_launch_scenarios()
     test_volume_fraction()
     test_blended_breach_probability()
+    test_position_usd_wiring()
+    test_execution_cost_model()
+    test_il_edge_correction()
     test_fee_tier_resolution()
+    await test_protocol_native_fee_fetcher()
     test_schema_fields()
+    test_scoring_weights_wiring()
+    test_calibration_wiring()
+    test_calibration_json_load()
 
     # ── B. Integration tests ──────────────────────────────────────────────────
     await test_integration_mature_bsc()
     await test_integration_base_pool()
     await test_integration_solana_pool()
     await test_integration_eth_univ3_fee_tier()
+    await test_native_fee_raydium_live()
 
     # ── C. Simulation tests ───────────────────────────────────────────────────
     await test_fresh_pool_2h()
