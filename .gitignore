@@ -40,3 +40,7 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# AI session files (Claude Code internal — not project deliverables)
+docs/claude_code_starter_prompt.txt
+docs/project_memory_for_followup_chat.md
