@@ -687,16 +687,26 @@ GET /api/v1/lp-range/{chain}/{pool_address}?position_usd=5000
 
 ## 八、已完成 vs 待办（截至 2026-03-27 最新 commit）
 
-**最新 commit 链（main 分支，从旧到新）：**
+**Demo-ready 基线：`a074e73`（branch `main`）**
+
+**完整 commit 链（main 分支，从旧到新，仅 P2 阶段）：**
 ```
-52adb7b docs(phase1.5): add implementation status, validation report ...
-860737e feat(p2.1.1): pool-specific volume correction via DexScreener volume.h24  ✓已完成
-4c80681 feat(p2.1.2): fee tier resolution with feeTier-first priority             ✓已完成
-04d54be P2.1.3: promote source_quality to pool_candle when pool volume exists      ✓已完成
-2992b1b feat(p2.2.3): blended breach probability via GBM terminal OOR proxy        ✓已完成
+52adb7b docs(phase1.5): implementation status, validation report, release notes
+860737e feat(p2.1.1): pool-specific volume correction via DexScreener volume.h24
+4c80681 feat(p2.1.2): fee tier resolution with feeTier-first priority
+04d54be P2.1.3: promote source_quality to pool_candle when pool volume exists
+2992b1b feat(p2.2.3): blended breach probability via GBM terminal OOR proxy
+34297a0 fix(frontend): shrunk_fee_apr display value + execution_cost_fraction rendering
+3c0b5f7 feat(frontend): evidence strength info card for young/blended pools
+6aede3b feat(backend/infra): execution cost model, fee fetcher, calibration config
+a4aeefa feat(backend/algo): P2.2.1a IL edge correction, P2.3.1 execution cost, confidence calibration
+9e8ed40 test(backend): expand validate_backend.py for P2.x features
+793771d feat(scripts): offline calibration script + sample calibration.json
+c68badd docs: update phase2 plan; add handoff context
+a074e73 chore: gitignore AI session files  ← DEMO-READY BASELINE
 ```
 
-### ✅ 已完成（P2 阶段）
+### ✅ 已完成（P2 阶段，截至 a074e73）
 
 **P2.1.1 Pool-specific volume correction（已完成）**
 ```python
@@ -732,7 +742,27 @@ _source_quality = (
 - `analytical_oor` = GBM 终端 OOR 概率（非首次穿越，保守下界）
 - 年轻池（replay_weight 低）更多依赖 GBM 分析解
 
+**P2.2.1a IL edge correction heuristic（已完成）**
+- `_il_edge_weight()` 在 final price 靠近区间边界时放大 IL（最多 1.4×）
+- 仅作用于 in-range IL 路径；OOR 路径不受影响
+- 注：这是终端价格启发式，不是真实 tick 流动性模型
+
+**P2.3.1 Execution cost model（已完成）**
+- `execution_cost.py`：链感知 gas + 滑点模型
+- `execution_cost_fraction` 字段在 API 响应和前端中均可见
+- `position_usd` 参数支持（API POST/GET 均支持，缓存按 position-specific 绕过）
+
+**前端 Bug 修复（已完成）**
+- `shrunk_fee_apr` 显示值错误（年轻池显示 `expected` 而非 `shrunk`）已修复
+- `execution_cost_fraction` 未渲染已修复
+- Evidence strength 信息卡（`effective_evidence_score` / `replay_weight` / `scenario_weight`）已添加
+
 ### 🟡 待办（中优先级）
+
+**P2.1.2 真实 fee tier（部分完成，需配置）**
+- `fee_fetcher.py` 已实现 Uniswap V3 subgraph 查询
+- 只需在 `.env` 配置 `UNISWAP_V3_SUBGRAPH_ETHEREUM` / `UNISWAP_V3_SUBGRAPH_BASE`
+- DexScreener `feeTier` 字段不存在（已确认），subgraph 是唯一可靠来源
 
 **P2.2.2 LP 仓位竞争因子（crowding）**
 - 当前：fee 捕获 ∝ position/pool TVL（线性假设）
@@ -741,16 +771,10 @@ _source_quality = (
 **P2.3.2 CEX/DEX price divergence signal**
 - OKX CEX 价格 spread > 1% 时强制标记 chaotic（需 CEX 价格 API 集成）
 
-**Uniswap V3 subgraph fee（低成本）**
-- 代码已写好，只需配置 ENV: `UNISWAP_V3_SUBGRAPH_ETHEREUM`、`UNISWAP_V3_SUBGRAPH_BASE`
-
 ### 🟢 低优先级
 
 **GBM terminal → first-passage 升级**
 - 当前 breach_prob 是终端概率（lower bound），可升级为 double-barrier first-passage 解析解
-
-**前端完整联调验证**
-- `LPAnalysis.tsx` 已对接所有字段，但未做端到端回归测试（新字段的视觉渲染 + 边界情况）
 
 ---
 
@@ -809,9 +833,14 @@ ENV 变量（highest） > calibration.json > Python 默认值（lowest）
 
 ## 十一、下一步推荐
 
-最高价值的下一步是 **P2.1.1 Pool-specific volume**：
-- 改动量小（range_recommender.py 和 range_backtester.py 各几行）
-- 影响大（fee APR 从虚高变真实，影响所有池子的所有 profile）
-- 无新 API 依赖（DexScreener 已经返回这个字段）
+**P2.1.1 / P2.1.3 / P2.2.1a / P2.2.3 / P2.3.1 均已完成**（截至 `a074e73`）。
 
-其次是 **P2.1.3 Source quality 升级**（依赖 P2.1.1 完成后一并做）。
+当前最高价值的下一步是 **P2.1.2 真实 fee tier（配置激活）**：
+- 代码已经写好（`fee_fetcher.py` + `config.py` 中的 subgraph URL 字段）
+- 只需要找到一个可用的 Uniswap V3 subgraph endpoint 并配置 ENV
+- 影响：Uniswap V3 非标准档位（0.05%/1%）不再默认 0.3%，fee APR 误差可达 6×
+- 无需算法改动
+
+其次是 **P2.3.2 CEX/DEX price divergence signal**：
+- OKX CEX API 已有 key，只需新增一个端点调用
+- 高波动事件时 regime 检测更准确
