@@ -1,16 +1,29 @@
 """
 CEX spot price fetcher — P2.3.2 CEX/DEX price divergence signal.
 
-Fetches the base-token spot price from OKX public API (no auth required)
-and computes relative divergence vs DexScreener priceUsd.
+Primary use case: Solana (chain=501) pools on Raydium / Meteora / Orca.
+All major Solana liquid tokens (SOL, JUP, JTO, BONK, WIF, PYTH, RAY)
+map directly to OKX USDT spot pairs and are supported out of the box.
+
+Also covers EVM Uniswap V3 pools (chain 1/8453/137) as a secondary case.
+
+Implementation is chain-agnostic: it reads `base_token_symbol` from the
+DexScreener pool state dict and looks up the OKX instId by symbol only.
+No chain_index check needed.
+
+Price comparison:
+  dex_price_usd (DexScreener priceUsd) ≈ token price in USD
+  OKX {TOKEN}-USDT last            ≈ token price in USDT ≈ USD
+  Both quote against USD/USDT — directly comparable.
+  USDC-quoted pools (SOL/USDC) vs USDT quote: USDC peg ≈ $1 → valid.
 
 When divergence >= threshold (default 1%) the caller receives a modified
 RegimeResult with regime overridden to "chaotic".  All failures are logged
 at DEBUG level; the original regime_result is returned unchanged.
 
 Symbol mapping:
-  map_dex_to_okx_symbol(base, quote) → OKX instId (e.g. "ETH-USDT")
-  Unmappable tokens return None → CEX check is skipped silently.
+  map_dex_to_okx_symbol(base, quote) → OKX instId (e.g. "SOL-USDT")
+  Unmappable / DEX-only tokens return None → CEX check skipped silently.
 
 Main entry point:
   apply_cex_regime_override(regime_result, dex_price_usd, base_symbol, quote_symbol)
@@ -31,8 +44,10 @@ _TIMEOUT = 5.0   # keep short — CEX check must not block the recommendation
 
 # ── Symbol normalisation ──────────────────────────────────────────────────────
 # Wrapped / synthetic → canonical OKX base symbol.
-# Only list tokens that need renaming; everything else is tried as-is.
+# Solana tokens (SOL, JUP, JTO, BONK, WIF, PYTH, RAY) pass through as-is.
+# Only entries that need renaming are listed here.
 _UNWRAP: dict[str, str] = {
+    # EVM wrapped tokens
     "WETH":   "ETH",
     "WBTC":   "BTC",
     "CBBTC":  "BTC",
@@ -44,7 +59,8 @@ _UNWRAP: dict[str, str] = {
     "WAVAX":  "AVAX",
     "WMATIC": "POL",   # MATIC → POL rename effective on OKX 2024
     "MATIC":  "POL",
-    # "POL": "POL" — identity, no entry needed
+    # Solana wrapped / bridged
+    "WSOL":   "SOL",   # wrapped SOL used as quote in some Raydium pairs
 }
 
 # Stablecoin symbols — skip pairs where the base is a stablecoin.
@@ -54,26 +70,39 @@ _STABLES: frozenset[str] = frozenset({
     "FDUSD", "USDP",
 })
 
+# Tokens confirmed to not have a spot listing on OKX.
+# Returning None here avoids a guaranteed-51001 API round-trip.
+# Add only tokens verified absent from OKX; otherwise let fail-open handle it.
+_NO_CEX: frozenset[str] = frozenset({
+    "ORCA",   # Orca DEX governance token — delisted / never listed on OKX
+})
+
 # Divergence threshold: override regime to "chaotic" when |dex - cex| / cex >= this.
 DEFAULT_THRESHOLD = 0.01   # 1%
 
 
 def map_dex_to_okx_symbol(base_symbol: str, quote_symbol: str) -> Optional[str]:
     """
-    Return the OKX spot instId (e.g. 'ETH-USDT') for a DEX base/quote pair.
+    Return the OKX spot instId (e.g. 'SOL-USDT') for a DEX base/quote pair.
 
     Returns None when:
-    - Base token is a stablecoin (no meaningful cross-vs-USD price)
-    - Both tokens are stablecoins
-    - Token cannot be mapped (exotic / LP / receipt token)
+    - Base token is a stablecoin (stable-swap pool, no meaningful cross price)
+    - Base token is in _NO_CEX (confirmed not listed on OKX — skip API call)
+    - Token is exotic / LP / receipt token that slips through as None from OKX
 
-    The returned symbol always uses USDT as quote because OKX USDT pairs
-    are most liquid and closest to USD spot.
+    Solana tokens: SOL, JUP, JTO, BONK, WIF, PYTH, RAY → pass through as-is.
+    EVM wrapped: WETH→ETH, WBTC→BTC, WMATIC→POL, WSOL→SOL, etc.
+
+    Always returns USDT-quoted instId; OKX USDT pairs are most liquid.
+    USDC-quoted DEX pools compare fine: USDC peg ≈ $1.00 ≈ USDT.
     """
     base = base_symbol.upper().strip()
 
     if base in _STABLES:
-        # e.g. USDC/USDT stable-swap pool — skip
+        return None
+
+    if base in _NO_CEX:
+        logger.debug("cex_price: %s is in _NO_CEX skip list", base)
         return None
 
     okx_base = _UNWRAP.get(base, base)

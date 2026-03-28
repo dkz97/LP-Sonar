@@ -2113,13 +2113,38 @@ async def test_cex_dex_divergence() -> None:
     check(len(_calls) == 0,           "Case 4: stable-stable → fetch NOT called")
     check(r4 == baseline,             "Case 4: regime unchanged for unmappable pair")
 
+    # ── Solana token mapping audit ─────────────────────────────────
+    solana_map_cases = [
+        ("SOL",  "USDC", "SOL-USDT"),
+        ("JUP",  "USDC", "JUP-USDT"),
+        ("JTO",  "USDC", "JTO-USDT"),
+        ("BONK", "USDC", "BONK-USDT"),
+        ("WIF",  "USDC", "WIF-USDT"),
+        ("PYTH", "USDC", "PYTH-USDT"),
+        ("RAY",  "USDC", "RAY-USDT"),
+        ("WSOL", "USDC", "SOL-USDT"),    # wrapped SOL → SOL
+        ("ORCA", "USDC", None),          # _NO_CEX skip
+        ("USDC", "SOL",  None),          # stable base skip
+        ("USDT", "SOL",  None),          # stable base skip
+    ]
+    for base, quote, expected in solana_map_cases:
+        got = map_dex_to_okx_symbol(base, quote)
+        check(got == expected,
+              f"Solana map: {base}/{quote} → {expected}",
+              f"got={got}")
+
     # ── Live smoke test (real OKX network) ────────────────────────
     try:
-        live_price = await fetch_cex_spot_price("ETH-USDT")
-        check(live_price is not None and live_price > 100,
-              "Live: ETH-USDT price from OKX", f"last={live_price}")
+        sol_price = await fetch_cex_spot_price("SOL-USDT")
+        check(sol_price is not None and sol_price > 1,
+              "Live: SOL-USDT price from OKX (Solana primary)", f"last={sol_price}")
+        eth_price = await fetch_cex_spot_price("ETH-USDT")
+        check(eth_price is not None and eth_price > 100,
+              "Live: ETH-USDT price from OKX", f"last={eth_price}")
         none_price = await fetch_cex_spot_price("FAKECOIN-USDT")
         check(none_price is None, "Live: unknown symbol returns None (fail-open)")
+        orca_price = await fetch_cex_spot_price("ORCA-USDT")
+        check(orca_price is None, "Live: ORCA-USDT not on OKX → None (fail-open)")
     except Exception as e:
         _warn("Live OKX smoke test skipped", str(e))
 
