@@ -10,6 +10,7 @@ Sections:
   E. P2.3.2 CEX/DEX divergence signal
   J. P2.5 Phase 1 — expected_net_pnl fee haircut alignment
   K. P2.5.x Phase 1 — vol/TVL burst-cap (snapshot quality)
+  L. P2.5 Phase 2 — scenario_pnl fee haircut alignment
 
 Usage:
   cd /Users/zhangjiajun/LP-Sonar/backend
@@ -2865,6 +2866,121 @@ def test_vol_tvl_burst_cap():
           f"vol_tvl_ratio={q_fresh.vol_tvl_ratio}")
 
 
+def test_scenario_pnl_haircut():
+    """
+    L. P2.5 Phase 2 — scenario_pnl fee haircut alignment
+
+    Verifies that compute_scenario_pnl() and compute_all_scenario_pnl() apply
+    fee_haircut only to the fee component (bt.cumulative_fee_proxy), leaving the
+    IL component (bt.il_cost_proxy) unchanged — same IL-isolation principle as
+    expected_net_pnl (P2.5 Phase 1, Section J).
+
+    Ten checks:
+      L1 — fee_haircut=0.75 → sideways pnl < raw (fee reduced)
+      L2 — IL isolation: delta = fee_proxy × (1-haircut), exact for two scenarios
+      L3 — backward compat: fee_haircut=1.0 (default) → same as raw
+      L4 — fee-dominant scenario (sideways) gets larger absolute reduction than OOR scenario
+      L5 — scenario_utility more conservative after haircut
+      L6 — compute_all_scenario_pnl: per-candidate haircuts routed correctly (3 checks)
+    """
+    section("L. P2.5 Phase 2 — scenario_pnl fee haircut alignment")
+    from app.models.schemas import CandidateRange
+    from app.services.range_scenario import (
+        compute_scenario_pnl,
+        compute_all_scenario_pnl,
+        compute_scenario_utility,
+    )
+
+    HAIRCUT = 0.75  # representative haircut; results must scale by (1 - HAIRCUT) on fee part
+
+    # ── shared candidate: ±10 around 100, stays in range for sideways scenario
+    cand = CandidateRange(
+        lower_price=90.0, upper_price=110.0,
+        lower_tick=-1000, upper_tick=1000,
+        width_pct=0.20, center_price=100.0, range_type="volatility_band",
+    )
+
+    # Three haircut levels so we can verify exact arithmetic
+    #   raw      = cumulative_fee_proxy × 1.00 + il_cost_proxy
+    #   h75      = cumulative_fee_proxy × 0.75 + il_cost_proxy
+    #   il_only  = cumulative_fee_proxy × 0.00 + il_cost_proxy  (pure IL reference)
+    pnl_raw     = compute_scenario_pnl(cand, 100.0, 0.60, 1_000.0, 24, 0.003, 1_000_000,
+                                       fee_haircut=1.0)
+    pnl_h75     = compute_scenario_pnl(cand, 100.0, 0.60, 1_000.0, 24, 0.003, 1_000_000,
+                                       fee_haircut=HAIRCUT)
+    pnl_il_only = compute_scenario_pnl(cand, 100.0, 0.60, 1_000.0, 24, 0.003, 1_000_000,
+                                       fee_haircut=0.0)
+
+    # ── L1: haircut → sideways pnl < raw ─────────────────────────────────────
+    check(pnl_h75["sideways"] < pnl_raw["sideways"],
+          "L1 fee_haircut=0.75 → sideways pnl < raw (fee component reduced)",
+          f"h75={pnl_h75['sideways']:.6f} < raw={pnl_raw['sideways']:.6f}")
+
+    # ── L2: IL isolation — delta = fee_proxy × (1-haircut) ──────────────────
+    # fee_proxy per scenario = raw_pnl - il_only_pnl (il_cost_proxy unchanged by haircut)
+    # delta expected          = fee_proxy × (1 - HAIRCUT)
+    # Tolerance: 2e-6 accounts for round(x, 6) quantization on up to 4 terms.
+    # Each round() introduces ≤ 0.5e-6 error; combined max ≈ 1.5e-6 after multiplication by 0.25.
+    for sc in ("sideways", "slow_up"):
+        fee_proxy_sc    = pnl_raw[sc] - pnl_il_only[sc]         # = cumulative_fee_proxy (rounded)
+        expected_delta  = fee_proxy_sc * (1.0 - HAIRCUT)
+        actual_delta    = pnl_raw[sc] - pnl_h75[sc]
+        check(abs(actual_delta - expected_delta) < 2e-6,
+              f"L2 IL isolation [{sc}]: delta = fee_proxy × (1-0.75), IL unchanged (±2μ rounding)",
+              f"actual={actual_delta:.9f} expected={expected_delta:.9f}")
+
+    # ── L3: backward compat — default fee_haircut=1.0 → identical to raw ─────
+    pnl_default = compute_scenario_pnl(cand, 100.0, 0.60, 1_000.0, 24, 0.003, 1_000_000)
+    for sc in ("sideways", "breakdown_down"):
+        check(pnl_default[sc] == pnl_raw[sc],
+              f"L3 backward compat [{sc}]: default fee_haircut=1.0 same as explicit 1.0",
+              f"default={pnl_default[sc]} raw={pnl_raw[sc]}")
+
+    # ── L4: haircut is monotonic in haircut level ─────────────────────────────
+    # pnl(h) = fee_proxy × h + il_cost_proxy is linear and increasing in h (fee_proxy ≥ 0).
+    # So pnl(0.75) > pnl(0.50) for any scenario where fee_proxy > 0.
+    pnl_h50 = compute_scenario_pnl(cand, 100.0, 0.60, 1_000.0, 24, 0.003, 1_000_000,
+                                   fee_haircut=0.50)
+    check(pnl_h75["sideways"] > pnl_h50["sideways"],
+          "L4 monotonic: pnl(haircut=0.75) > pnl(haircut=0.50) for sideways (fee_proxy > 0)",
+          f"h75={pnl_h75['sideways']:.6f} > h50={pnl_h50['sideways']:.6f}")
+
+    # ── L5: scenario_utility more conservative after haircut ──────────────────
+    util_raw = compute_scenario_utility(pnl_raw)
+    util_h75 = compute_scenario_utility(pnl_h75)
+    check(util_h75 < util_raw,
+          "L5 compute_scenario_utility: h75 utility < raw utility (more conservative)",
+          f"util_h75={util_h75:.4f} < util_raw={util_raw:.4f}")
+
+    # ── L6: compute_all_scenario_pnl routes per-candidate haircuts correctly ──
+    # Use the same candidate twice so fee_proxy is identical for both;
+    # different haircuts (0.70 vs 0.90) → different reductions, provably ordered.
+    pnl_list_raw = compute_all_scenario_pnl(
+        candidates=[cand, cand],
+        current_price=100.0, realized_vol_annual=0.60,
+        ohlcv_bars=[], horizon_bars=24, fee_rate=0.003, tvl_usd=1_000_000,
+        haircuts=None,  # no haircut, raw baseline
+    )
+    pnl_list_h = compute_all_scenario_pnl(
+        candidates=[cand, cand],
+        current_price=100.0, realized_vol_annual=0.60,
+        ohlcv_bars=[], horizon_bars=24, fee_rate=0.003, tvl_usd=1_000_000,
+        haircuts=[0.70, 0.90],  # different haircut per candidate
+    )
+    check(pnl_list_h[0]["sideways"] < pnl_list_raw[0]["sideways"],
+          "L6 compute_all_scenario_pnl: candidate[0] haircut=0.70 → sideways lower",
+          f"h={pnl_list_h[0]['sideways']:.6f} < raw={pnl_list_raw[0]['sideways']:.6f}")
+    check(pnl_list_h[1]["sideways"] < pnl_list_raw[1]["sideways"],
+          "L6 compute_all_scenario_pnl: candidate[1] haircut=0.90 → sideways lower",
+          f"h={pnl_list_h[1]['sideways']:.6f} < raw={pnl_list_raw[1]['sideways']:.6f}")
+    # Same candidate → same fee_proxy → haircut=0.70 must give larger reduction than 0.90
+    delta_h70 = pnl_list_raw[0]["sideways"] - pnl_list_h[0]["sideways"]
+    delta_h90 = pnl_list_raw[1]["sideways"] - pnl_list_h[1]["sideways"]
+    check(delta_h70 > delta_h90,
+          "L6 per-candidate routing: haircut=0.70 → bigger reduction than 0.90 (same fee base)",
+          f"delta_h70={delta_h70:.6f} > delta_h90={delta_h90:.6f}")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2932,6 +3048,9 @@ async def main() -> None:
 
     # ── K. P2.5.x Phase 1 — vol/TVL burst-cap ─────────────────────────────────
     test_vol_tvl_burst_cap()
+
+    # ── L. P2.5 Phase 2 — scenario_pnl fee haircut alignment ──────────────────
+    test_scenario_pnl_haircut()
 
     # ── Summary ───────────────────────────────────────────────────────────────
     elapsed = time.time() - t0

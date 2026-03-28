@@ -291,7 +291,7 @@ def _scored_to_profile(
     # Consistency guarantee:
     #   expected_fee_apr  ← haircut-aware (width_f × tvl_f × capture) since P2.2.2 + P2.3.3
     #   expected_net_pnl  ← haircut-aware (this change, P2.5 Phase 1)
-    #   scenario_pnl      ← still raw replay proxy (deferred to P2.5 Phase 2)
+    #   scenario_pnl      ← haircut-aware (P2.5 Phase 2, applied in compute_scenario_pnl)
     #
     # Only the fee component is discounted. IL is driven by price path, not LP competition,
     # so b.il_cost_proxy passes through unchanged. The backtester layer remains pure:
@@ -739,6 +739,20 @@ async def recommend_range(
 
     # ── 7. Scenario PnL ──────────────────────────────────────────────────
     use_launch = sufficiency.history_tier in ("fresh", "infant")
+
+    # P2.5 Phase 2: per-candidate fee haircut factors from scored.
+    # scored is already available (section 6); tick bounds uniquely identify each candidate.
+    # Fail-safe: .get(..., 1.0) → no haircut for any candidate not found in scored
+    # (should never happen, but defensive coding against list length edge cases).
+    _haircut_map = {
+        (s.candidate.lower_tick, s.candidate.upper_tick): s.fee_haircut_factor
+        for s in scored
+    }
+    candidate_haircuts = [
+        _haircut_map.get((c.lower_tick, c.upper_tick), 1.0)
+        for c in candidates
+    ]
+
     scenario_pnl_list = compute_all_scenario_pnl(
         candidates=candidates,
         current_price=current_price,
@@ -749,6 +763,7 @@ async def recommend_range(
         tvl_usd=pool["tvl_usd"],
         use_launch_scenarios=use_launch,
         volume_scale=volume_fraction,   # P2.1.1: pool-specific volume correction
+        haircuts=candidate_haircuts,    # P2.5 Phase 2: fee-honest scenario PnL
     )
 
     tick_to_scenario: dict[tuple[int, int], dict[str, float]] = {

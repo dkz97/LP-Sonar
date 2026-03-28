@@ -203,6 +203,7 @@ def compute_scenario_pnl(
     fee_rate: float,
     tvl_usd: float,
     scenario_names: list[str] | None = None,
+    fee_haircut: float = 1.0,
 ) -> dict[str, float]:
     """
     Compute expected net PnL under each scenario for a single candidate range.
@@ -218,10 +219,17 @@ def compute_scenario_pnl(
     tvl_usd               Pool TVL in USD.
     scenario_names        Which scenarios to run. Defaults to SCENARIO_NAMES (mature).
                           Pass LAUNCH_SCENARIO_NAMES for fresh/infant pools.
+    fee_haircut           Three-layer fee discount (width_f × tvl_f × capture_ratio).
+                          Applied to the fee component only — IL is path-driven and
+                          must not be discounted. Default 1.0 (no haircut) for
+                          backward compat and any caller that doesn't pass a haircut.
+                          P2.5 Phase 2: range_recommender passes scored.fee_haircut_factor.
 
     Returns
     -------
     Dict mapping scenario_name → net_pnl (fraction of capital, can be negative).
+    net_pnl = bt.cumulative_fee_proxy × fee_haircut + bt.il_cost_proxy
+    Consistent with expected_net_pnl (P2.5 Phase 1) and expected_fee_apr.
     """
     names = scenario_names if scenario_names is not None else SCENARIO_NAMES
     result: dict[str, float] = {}
@@ -241,7 +249,11 @@ def compute_scenario_pnl(
             fee_rate=fee_rate,
             tvl_usd=tvl_usd,
         )
-        result[scenario] = round(bt.realized_net_pnl_proxy, 6)
+        # P2.5 Phase 2: apply fee haircut to fee component only.
+        # IL (bt.il_cost_proxy) is driven by price path, not LP competition density,
+        # so it passes through unchanged — same principle as expected_net_pnl (P2.5 Phase 1).
+        # Backtester layer stays pure: bt.cumulative_fee_proxy is still raw replay output.
+        result[scenario] = round(bt.cumulative_fee_proxy * fee_haircut + bt.il_cost_proxy, 6)
 
     return result
 
@@ -285,6 +297,7 @@ def compute_all_scenario_pnl(
     tvl_usd: float,
     use_launch_scenarios: bool = False,
     volume_scale: float = 1.0,
+    haircuts: list[float] | None = None,
 ) -> list[dict[str, float]]:
     """
     Compute scenario PnL for each candidate in the list.
@@ -299,6 +312,10 @@ def compute_all_scenario_pnl(
                           token-level OKX volumes to pool-specific levels.
                           Only applied when avg_volume is derived from bars (not fallback).
                           Default 1.0 (no scaling).
+    haircuts              Per-candidate fee haircut factors (width_f × tvl_f × capture_ratio),
+                          aligned with the candidates list. None or omitted → all 1.0
+                          (backward compat). Passed from range_recommender via
+                          scored[i].fee_haircut_factor (P2.5 Phase 2).
 
     Returns a list of dicts (same order as candidates).
     """
@@ -321,6 +338,7 @@ def compute_all_scenario_pnl(
             fee_rate=fee_rate,
             tvl_usd=tvl_usd,
             scenario_names=scenario_names,
+            fee_haircut=haircuts[i] if haircuts is not None else 1.0,
         )
-        for c in candidates
+        for i, c in enumerate(candidates)
     ]
