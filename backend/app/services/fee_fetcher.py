@@ -1,15 +1,19 @@
 """
-Protocol-native fee rate fetcher (P2.1 Protocol-native fee tier).
+Protocol-native fee rate fetcher (P2.1.2 Protocol-native fee tier).
 
 Priority chain used by _fetch_pool_state():
-  1. fetch_protocol_fee_rate() — native protocol API / subgraph
+  1. fetch_protocol_fee_rate() — native protocol API / on-chain RPC
   2. _infer_fee_rate()          — DexScreener feeTier + static lookup (fallback)
 
 Supported protocols:
-  - Raydium CLMM   (chain 501)  : GET raydium_api_url/pools/info/ids?ids=...
-  - Meteora DLMM   (chain 501)  : GET meteora_api_url/pair/...
-  - Uniswap V3     (1, 8453)    : GraphQL subgraph (configurable URL)
-  - Uniswap V3     (137)        : GraphQL subgraph (optional; config uniswap_v3_subgraph_polygon)
+  - Raydium CLMM   (chain 501)        : GET raydium_api_url/pools/info/ids?ids=...
+  - Meteora DLMM   (chain 501)        : GET meteora_api_url/pair/...
+  - Uniswap V3     (chain 1, 8453, 137) : eth_call pool.fee() via public RPC (no API key needed)
+                                          Optional secondary: GraphQL subgraph (configurable URL)
+
+RPC approach: calls pool.fee() (selector 0xddca3f43) on the pool contract directly.
+Returns uint24 feeTier (500 / 3000 / 10000) / 1_000_000 = fee fraction.
+Default RPCs: publicnode.com free endpoints (no auth required).
 
 All functions return None on failure; callers must fall back to _infer_fee_rate().
 """
@@ -100,14 +104,84 @@ async def _meteora_fee(pool_address: str) -> Optional[float]:
     return _validate_fee(fee)
 
 
+_FEE_SELECTOR = "0xddca3f43"   # keccak256("fee()") first 4 bytes
+
+
+async def _uniswap_v3_rpc_fee(pool_address: str, chain_index: str) -> Optional[float]:
+    """
+    Fetch Uniswap V3 pool fee tier via eth_call to pool.fee().
+
+    Calls the pool contract's fee() function (selector 0xddca3f43) directly,
+    requiring no API key.  RPC endpoints default to publicnode.com free nodes
+    and can be overridden via ETH_RPC_URL / BASE_RPC_URL / POLYGON_RPC_URL.
+
+    Response: ABI-encoded uint24 (32 bytes) — e.g. 0x...0001f4 → 500 → 0.05%
+    feeTier / 1_000_000 = fee fraction
+    """
+    rpc_url_map: dict[str, str] = {
+        "1":    settings.eth_rpc_url,
+        "8453": settings.base_rpc_url,
+        "137":  settings.polygon_rpc_url,
+    }
+    rpc_url = rpc_url_map.get(chain_index, "")
+    if not rpc_url:
+        logger.debug(
+            "uniswap_v3_rpc_fee: no RPC URL configured chain=%s pool=%.8s",
+            chain_index, pool_address,
+        )
+        return None
+
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [{"to": pool_address, "data": _FEE_SELECTOR}, "latest"],
+        "id": 1,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.post(rpc_url, json=payload)
+            if resp.status_code != 200:
+                logger.debug(
+                    "uniswap_v3_rpc_fee: HTTP %s chain=%s pool=%.8s",
+                    resp.status_code, chain_index, pool_address,
+                )
+                return None
+            data = resp.json()
+    except Exception as e:
+        logger.debug(
+            "uniswap_v3_rpc_fee: request error chain=%s pool=%.8s: %s",
+            chain_index, pool_address, e,
+        )
+        return None
+
+    try:
+        hex_result: str = data["result"]
+        if not hex_result or hex_result == "0x":
+            return None
+        fee_tier = int(hex_result, 16)
+        fee = float(fee_tier) / 1_000_000.0
+    except (KeyError, TypeError, ValueError) as e:
+        logger.debug(
+            "uniswap_v3_rpc_fee: parse error chain=%s pool=%.8s: %s",
+            chain_index, pool_address, e,
+        )
+        return None
+
+    return _validate_fee(fee)
+
+
 async def _uniswap_v3_subgraph_fee(pool_address: str, chain_index: str) -> Optional[float]:
     """
-    Fetch fee rate from Uniswap V3 subgraph (configurable URL).
+    Fetch fee rate from Uniswap V3 subgraph (optional, requires configured URL).
+
+    Used as a secondary path when a private subgraph URL is configured.
+    The Graph decentralized network requires a paid API key; leave these
+    settings empty to rely on the RPC path above.
 
     Subgraph URLs configured in settings:
       chain 1    → uniswap_v3_subgraph_ethereum
       chain 8453 → uniswap_v3_subgraph_base
-      chain 137  → uniswap_v3_subgraph_polygon (optional)
+      chain 137  → uniswap_v3_subgraph_polygon
 
     Query: { pool(id: "<address>") { feeTier } }
     feeTier is integer units: 500 → 0.05%, 3000 → 0.3%, 10000 → 1%
@@ -120,10 +194,6 @@ async def _uniswap_v3_subgraph_fee(pool_address: str, chain_index: str) -> Optio
     }
     subgraph_url = subgraph_url_map.get(chain_index, "")
     if not subgraph_url:
-        logger.debug(
-            "uniswap_v3_subgraph_fee: no subgraph URL configured chain=%s pool=%.8s",
-            chain_index, pool_address,
-        )
         return None
 
     query = '{ pool(id: "%s") { feeTier } }' % pool_address.lower()
@@ -164,19 +234,20 @@ async def fetch_protocol_fee_rate(
     pair: dict,
 ) -> Optional[float]:
     """
-    Attempt to fetch the fee rate from the protocol's native API or subgraph.
+    Attempt to fetch the fee rate from the protocol's native API or on-chain RPC.
 
     Returns the fee rate as a fraction (e.g. 0.003 for 0.3%) or None if:
       - Protocol not supported by native fetch
-      - API call failed
+      - All fetch attempts failed
       - Parsed fee is outside validity bounds
 
     Callers must fall back to _infer_fee_rate(dex_id, pair) when this returns None.
 
     Protocol routing:
-      raydium-clmm  (chain 501)       → Raydium CLMM pool info API
-      meteora-dlmm  (chain 501)       → Meteora DLMM pair API
-      uniswap-v3    (chain 1, 8453, 137) → Uniswap V3 subgraph (URL must be configured)
+      raydium-clmm  (chain 501)          → Raydium CLMM pool info API
+      meteora-dlmm  (chain 501)          → Meteora DLMM pair API
+      uniswap-v3    (chain 1, 8453, 137) → eth_call pool.fee() via RPC (primary)
+                                           → GraphQL subgraph (secondary, if URL configured)
     """
     dex = dex_id.lower()
 
@@ -187,6 +258,11 @@ async def fetch_protocol_fee_rate(
         return await _meteora_fee(pool_address)
 
     if dex == "uniswap-v3" and chain_index in ("1", "8453", "137"):
+        # Primary: on-chain RPC (no API key needed, works with public free nodes)
+        fee = await _uniswap_v3_rpc_fee(pool_address, chain_index)
+        if fee is not None:
+            return fee
+        # Secondary: subgraph (only if URL configured — requires paid API key on The Graph network)
         return await _uniswap_v3_subgraph_fee(pool_address, chain_index)
 
     # Protocol not covered by native fetch

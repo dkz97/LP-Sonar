@@ -23,9 +23,16 @@ class Settings(BaseSettings):
     # DEX Screener (cross-chain pool discovery, 300 req/min, no auth)
     dexscreener_api_url: str = "https://api.dexscreener.com"
 
-    # Uniswap V3 subgraph URLs for protocol-native fee tier (P2.1 fee tier)
-    # Set these to The Graph hosted service or your own subgraph endpoint.
-    # Leave empty to skip subgraph fetch and rely on DexScreener feeTier fallback.
+    # Public EVM RPC endpoints for protocol-native fee tier (P2.1.2 fee tier via eth_call)
+    # Defaults are free public nodes — override in .env for higher rate limits or private RPCs.
+    # Set to empty string to disable RPC fee fetch for that chain (falls back to static lookup).
+    eth_rpc_url: str = "https://ethereum.publicnode.com"
+    base_rpc_url: str = "https://base.publicnode.com"
+    polygon_rpc_url: str = "https://polygon-bor.publicnode.com"
+
+    # Uniswap V3 subgraph URLs (optional, secondary to RPC)
+    # Set these if you have a private Graph node or a paid API key.
+    # Leave empty (default) — RPC path above is used instead.
     uniswap_v3_subgraph_ethereum: str = ""
     uniswap_v3_subgraph_base: str = ""
     uniswap_v3_subgraph_polygon: str = ""
