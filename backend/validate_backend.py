@@ -2496,6 +2496,131 @@ def test_competitive_capture_ratio() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# I. P2.4.1 — Regime confidence → breach risk inflation
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_regime_uncertainty_breach_penalty() -> None:
+    section("I. P2.4.1 — Regime confidence → breach risk inflation")
+
+    from app.models.schemas import (
+        BacktestResult, CandidateRange, ILRiskResult,
+        MarketQualityResult, RegimeResult,
+    )
+    from app.services.range_scorer import (
+        _regime_uncertainty_breach_penalty,
+        score_candidate,
+    )
+
+    quality = MarketQualityResult(
+        pool_address="0xTEST", wash_risk="low", wash_score=0.1,
+        vol_tvl_ratio=0.3, imbalance_ratio=0.5, avg_trade_size_usd=500.0,
+    )
+    il = ILRiskResult(level="medium", score=40, main_driver="vol")
+
+    def _regime(conf: float) -> RegimeResult:
+        return RegimeResult(
+            regime="range_bound", confidence=conf,
+            realized_vol=0.60, drift_slope=0.0, jump_ratio=0.05,
+        )
+
+    def _bt():
+        return BacktestResult(
+            in_range_time_ratio=0.75, cumulative_fee_proxy=0.04,
+            il_cost_proxy=-0.02, first_breach_bar=20,
+            breach_count=2, rebalance_count=1, realized_net_pnl_proxy=0.02,
+        )
+
+    def _cand(width_pct: float) -> CandidateRange:
+        c = 100.0; h = c * width_pct / 2.0
+        return CandidateRange(
+            lower_price=c - h, upper_price=c + h,
+            lower_tick=int(-h * 10), upper_tick=int(h * 10),
+            width_pct=width_pct, center_price=c, range_type="volatility_band",
+        )
+
+    # ── Case 1: high confidence → zero penalty ────────────────────────────────
+    p85 = _regime_uncertainty_breach_penalty(0.85)
+    check(p85 == 0.0, "Case 1: confidence=0.85 → penalty=0.0", f"got={p85}")
+
+    # ── Case 2: threshold boundary → zero penalty ─────────────────────────────
+    p70 = _regime_uncertainty_breach_penalty(0.70)
+    check(p70 == 0.0, "Case 2: confidence=0.70 → penalty=0.0 (boundary)", f"got={p70}")
+
+    # ── Case 3: low confidence → penalty > 0, breach_r increases ─────────────
+    p30 = _regime_uncertainty_breach_penalty(0.30)
+    check(p30 > 0.0,  "Case 3: confidence=0.30 → penalty > 0", f"got={p30:.4f}")
+    check(p30 < 0.08, "Case 3: penalty < MAX (0.08)",          f"got={p30:.4f}")
+
+    s_high = score_candidate(_cand(0.10), _bt(), il, quality, _regime(0.85),
+                             tvl_usd=500_000, horizon_bars=48)
+    s_low  = score_candidate(_cand(0.10), _bt(), il, quality, _regime(0.30),
+                             tvl_usd=500_000, horizon_bars=48)
+    check(s_low.breach_risk > s_high.breach_risk,
+          "Case 3: low-confidence breach_risk > high-confidence breach_risk",
+          f"high={s_high.breach_risk:.4f} low={s_low.breach_risk:.4f}")
+
+    # ── Case 4: monotonicity — same baseline, confidence decreasing ───────────
+    confs = [0.85, 0.70, 0.60, 0.50, 0.35, 0.20]
+    penalties = [_regime_uncertainty_breach_penalty(c) for c in confs]
+    check(all(penalties[i] <= penalties[i + 1] for i in range(len(penalties) - 1)),
+          "Case 4: penalty monotonically non-decreasing as confidence falls",
+          " ".join(f"{p:.4f}" for p in penalties))
+
+    # ── Case 5: profile ordering preserved before/after ──────────────────────
+    # Penalty = f(regime.confidence) only, same for every profile in the same pool.
+    # → Each profile's breach_risk shifts by the SAME delta → relative differences preserved.
+    low_reg  = _regime(0.35)
+    high_reg = _regime(0.85)
+    penalty_expected = _regime_uncertainty_breach_penalty(0.35)
+
+    # Use two distinct candidates; verify their individual deltas both equal the penalty
+    for w, label in [(0.10, "balanced"), (0.30, "conservative"), (0.02, "aggressive")]:
+        s_lo = score_candidate(_cand(w), _bt(), il, quality, low_reg,
+                               tvl_usd=500_000, horizon_bars=48)
+        s_hi = score_candidate(_cand(w), _bt(), il, quality, high_reg,
+                               tvl_usd=500_000, horizon_bars=48)
+        delta = round(s_lo.breach_risk - s_hi.breach_risk, 4)
+        check(abs(delta - penalty_expected) < 1e-3,
+              f"Case 5: {label} breach delta == penalty (ordering preserved)",
+              f"delta={delta:.4f} penalty={penalty_expected:.4f}")
+
+    # Verify utility difference between two profiles is same under high vs low confidence
+    # (because penalty is uniform — relative spread is preserved)
+    s_cons_lo = score_candidate(_cand(0.30), _bt(), il, quality, low_reg,
+                                tvl_usd=500_000, horizon_bars=48)
+    s_agg_lo  = score_candidate(_cand(0.02), _bt(), il, quality, low_reg,
+                                tvl_usd=500_000, horizon_bars=48)
+    s_cons_hi = score_candidate(_cand(0.30), _bt(), il, quality, high_reg,
+                                tvl_usd=500_000, horizon_bars=48)
+    s_agg_hi  = score_candidate(_cand(0.02), _bt(), il, quality, high_reg,
+                                tvl_usd=500_000, horizon_bars=48)
+    spread_lo = round(s_cons_lo.utility_score - s_agg_lo.utility_score, 4)
+    spread_hi = round(s_cons_hi.utility_score - s_agg_hi.utility_score, 4)
+    check(abs(spread_lo - spread_hi) < 1e-3,
+          "Case 5: utility spread cons–agg identical under low vs high confidence",
+          f"spread_lo={spread_lo:.4f} spread_hi={spread_hi:.4f}")
+
+    # ── Case 6: young pool — system does not collapse ─────────────────────────
+    # Simulate worst-case: minimum confidence, narrow range
+    s_worst = score_candidate(_cand(0.02), _bt(), il, quality, _regime(0.20),
+                              tvl_usd=500_000, horizon_bars=48)
+    check(s_worst.utility_score >= 0.0,
+          "Case 6: young/uncertain pool utility >= 0 (no collapse)",
+          f"utility={s_worst.utility_score:.4f}")
+    check(s_worst.breach_risk <= 1.0,
+          "Case 6: breach_risk capped at 1.0",
+          f"breach={s_worst.breach_risk:.4f}")
+
+    # ── Orthogonality: fee_score and il_score are not affected ────────────────
+    check(s_low.fee_score == s_high.fee_score,
+          "Orthogonal: fee_score unchanged by regime confidence",
+          f"high={s_high.fee_score:.4f} low={s_low.fee_score:.4f}")
+    check(s_low.il_score == s_high.il_score,
+          "Orthogonal: il_score unchanged by regime confidence",
+          f"high={s_high.il_score:.4f} low={s_low.il_score:.4f}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2553,6 +2678,9 @@ async def main() -> None:
 
     # ── H. P2.3.3 Competitive fee capture ratio ────────────────────────────────
     test_competitive_capture_ratio()
+
+    # ── I. P2.4.1 Regime confidence → breach inflation ────────────────────────
+    test_regime_uncertainty_breach_penalty()
 
     # ── Summary ───────────────────────────────────────────────────────────────
     elapsed = time.time() - t0

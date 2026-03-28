@@ -33,6 +33,17 @@ P2.3.3 — Competitive fee capture ratio (activity-driven competition):
     crowding_factor  — structural: how many LPs (width + TVL)
     capture_ratio    — dynamic: how contested the fee flow is (vol/TVL)
   Same width + same TVL → same crowding; different vol/TVL → different capture.
+
+P2.4.1 — Regime confidence → breach risk inflation:
+  Low confidence means the regime classifier is uncertain about vol/drift, so
+  the underlying breach probability estimate is less reliable.  An additive
+  penalty inflates breach_risk when confidence < threshold (0.70).
+  penalty ∈ [0, _BREACH_CONF_MAX]; applied after _breach_risk() in score_candidate().
+
+  No double-counting with:
+    uncertainty_penalty          — penalises evidence QUANTITY (data sufficiency)
+    _apply_confidence_calibration — scales the DISPLAY recommendation_confidence post-selection
+    jump_penalty in _breach_risk  — penalises chaotic RETURNS, not classifier uncertainty
 """
 from __future__ import annotations
 import logging
@@ -135,6 +146,28 @@ _CAPTURE_FLOOR     = 0.70   # minimum individual capture ratio (hottest pools)
 _CAPTURE_NEUTRAL   = 1.0    # vol/TVL inflection point — midpoint of sigmoid
 _CAPTURE_STEEPNESS = 1.5    # steepness of sigmoid transition
 
+# ── P2.4.1: Regime confidence → breach risk inflation ────────────────────────
+# When the regime classifier has low confidence, its vol/drift outputs are less
+# reliable, meaning breach probability estimates should be treated conservatively.
+#
+# Formula:
+#   shortfall = clip((THRESHOLD - confidence) / THRESHOLD, 0, 1)
+#   penalty   = shortfall × MAX
+#
+# Anchors (confidence → additive penalty to breach_risk):
+#   0.85 → 0.000  (high-confidence signal, no inflation)
+#   0.70 → 0.000  (threshold boundary, still no penalty)
+#   0.50 → 0.023  (moderate uncertainty)
+#   0.35 → 0.040  (weak regime signal — default fallback from detect_regime)
+#   0.20 → 0.057  (minimum confidence: insufficient bars fallback)
+#
+# Profile-ordering preservation: all profiles in the same pool see the SAME
+# regime confidence → SAME penalty → relative utility differences are preserved.
+#
+# max utility impact: w_breach × MAX = 0.25 × 0.08 = 0.02  (small but meaningful)
+_BREACH_CONF_THRESHOLD = 0.70   # confidence at or above this → no inflation
+_BREACH_CONF_MAX       = 0.08   # maximum additive penalty (confidence approaching 0)
+
 
 def _tvl_crowding_factor(tvl_usd: float) -> float:
     """
@@ -198,6 +231,34 @@ def _competitive_capture_ratio(vol_tvl_ratio: float) -> float:
     sigmoid = 1.0 / (1.0 + math.exp(-x))
     # Inverted sigmoid: high vol_tvl → high sigmoid → low capture
     return _CAPTURE_FLOOR + (1.0 - _CAPTURE_FLOOR) * (1.0 - sigmoid)
+
+
+def _regime_uncertainty_breach_penalty(confidence: float) -> float:
+    """
+    Additive breach risk inflation when regime confidence is low (P2.4.1).
+
+    Low confidence means the regime classifier is unsure about vol/drift, making
+    the breach probability estimate less reliable.  The penalty shifts breach_risk
+    conservatively upward without changing the relative ordering between profiles
+    (all candidates in the same pool receive the same penalty).
+
+    Formula:
+        shortfall = clip((THRESHOLD - confidence) / THRESHOLD, 0, 1)
+        penalty   = shortfall × _BREACH_CONF_MAX
+
+    Returns 0.0 for confidence >= _BREACH_CONF_THRESHOLD (no penalty for reliable regimes).
+    Returns 0.0 for confidence <= 0 (degenerate input guard — treated as maximally uncertain
+    but formula self-clamps to MAX anyway).
+
+    No overlap with:
+      - uncertainty_penalty in final_utility (that uses evidence QUANTITY)
+      - jump_penalty in _breach_risk (that uses chaotic RETURNS)
+      - _apply_confidence_calibration (that scales the DISPLAY output post-selection)
+    """
+    if confidence >= _BREACH_CONF_THRESHOLD:
+        return 0.0
+    shortfall = (_BREACH_CONF_THRESHOLD - max(confidence, 0.0)) / _BREACH_CONF_THRESHOLD
+    return round(min(_BREACH_CONF_MAX, shortfall * _BREACH_CONF_MAX), 4)
 
 
 # ── Analytical terminal OOR helpers (P2.2.3) ───────────────────────────────
@@ -500,6 +561,14 @@ def score_candidate(
         backtest, regime_result, candidate, horizon_bars,
         replay_weight=replay_weight, entry_price=entry_price,
     )
+    # P2.4.1: inflate breach risk when regime classifier confidence is low
+    conf_penalty = _regime_uncertainty_breach_penalty(regime_result.confidence)
+    if conf_penalty > 0:
+        breach_r = round(min(1.0, breach_r + conf_penalty), 4)
+        logger.debug(
+            "scorer: regime conf=%.3f → breach_penalty=%.4f breach_r=%.4f",
+            regime_result.confidence, conf_penalty, breach_r,
+        )
     rebalance_c = _rebalance_cost(backtest, tvl_usd, chain_index, position_usd)
     quality_p = _quality_penalty(quality_result, regime_result)
 
