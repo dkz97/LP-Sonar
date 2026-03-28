@@ -208,6 +208,8 @@ class RangeProfile(BaseModel):
     execution_cost_fraction: Optional[float] = None
     # P2.3.3: Competitive fee capture ratio (vol/TVL-driven LP competition discount)
     competitive_capture_ratio: Optional[float] = None
+    # P2.5: Total fee haircut = width_factor × tvl_factor × capture_ratio (all three discount layers)
+    fee_haircut_factor: Optional[float] = None
 
 
 class RangeRecommendation(BaseModel):

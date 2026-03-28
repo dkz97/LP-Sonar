@@ -379,12 +379,12 @@ function ProfileCard({ name, profile, isDefault }: ProfileCardProps) {
           ±{(profile.width_pct / 2).toFixed(1)}%
         </span>
 
-        {/* Utility score */}
+        {/* Primary score: use final_utility (P2 blended) when available, fall back to utility_score */}
         <span style={{
           fontSize: "11px", fontWeight: 700, fontFamily: "var(--font-mono)",
           color: accent, flexShrink: 0,
         }}>
-          {(profile.utility_score * 100).toFixed(0)}分
+          {((profile.final_utility ?? profile.utility_score) * 100).toFixed(0)}分
         </span>
 
         {expanded ? <ChevronUp size={13} style={{ color: "var(--text-muted)", flexShrink: 0 }} /> : <ChevronDown size={13} style={{ color: "var(--text-muted)", flexShrink: 0 }} />}
@@ -434,6 +434,13 @@ function ProfileCard({ name, profile, isDefault }: ProfileCardProps) {
                 label="执行成本"
                 value={`${(profile.execution_cost_fraction * 100).toFixed(3)}%`}
                 highlight="#f97316"
+              />
+            )}
+            {profile.fee_haircut_factor != null && profile.fee_haircut_factor < 0.99 && (
+              <MetricRow
+                label="手续费竞争折扣"
+                value={`${(profile.fee_haircut_factor * 100).toFixed(0)}%`}
+                highlight={profile.fee_haircut_factor < 0.75 ? "#f97316" : "#94a3b8"}
               />
             )}
           </div>

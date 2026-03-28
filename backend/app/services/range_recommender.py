@@ -338,6 +338,8 @@ def _scored_to_profile(
         execution_cost_fraction=round(exec_cost_frac, 6) if exec_cost_frac is not None else None,
         # P2.3.3
         competitive_capture_ratio=round(competitive_capture_ratio, 4) if competitive_capture_ratio is not None else None,
+        # P2.5: total fee discount (width_f × tvl_f × capture_ratio) — transparency for users
+        fee_haircut_factor=round(fee_haircut, 4),
     )
 
 

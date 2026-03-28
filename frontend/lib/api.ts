@@ -167,6 +167,8 @@ export interface RangeProfile {
   young_pool_adjustments?: string[]; // human-readable list of adjustments applied for young pools
   // P2.3.1: Execution cost as fraction of position capital (gas + slippage × rebalances)
   execution_cost_fraction?: number | null;
+  // P2.5: Total fee haircut = width_factor × tvl_factor × capture_ratio (all three discount layers)
+  fee_haircut_factor?: number | null;
 }
 
 export interface RangeRecommendation {
