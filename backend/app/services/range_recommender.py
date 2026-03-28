@@ -929,6 +929,27 @@ async def recommend_range(
         effective_position_usd=round(position_usd, 2),
     )
 
+    # ── Validation log (fail-safe) ────────────────────────────────────────
+    try:
+        from app.services.validation_logger import log_recommendation
+        _bal_scored = profiles_raw.get("balanced")
+        log_recommendation(
+            pool_address=pool_address,
+            chain_index=chain_index,
+            protocol=pool["protocol"],
+            current_price=current_price,
+            tvl_usd=pool["tvl_usd"],
+            volume_24h=pool["volume_24h"],
+            fee_rate=pool["fee_rate"],
+            history_tier=sufficiency.history_tier,
+            regime=regime_result.regime,
+            recommendation_confidence=result.recommendation_confidence,
+            balanced_profile=profiles.get("balanced"),
+            fee_haircut_factor=_bal_scored.fee_haircut_factor if _bal_scored else 1.0,
+        )
+    except Exception:  # noqa: BLE001
+        pass  # never let logging break the recommendation
+
     # Cache only when position_usd was not user-specified (result is position-generic)
     if not skip_cache:
         await _store_cached(chain_index, pool_address, result)
