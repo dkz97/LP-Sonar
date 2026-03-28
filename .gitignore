@@ -44,3 +44,11 @@ Thumbs.db
 # AI session files (Claude Code internal — not project deliverables)
 docs/claude_code_starter_prompt.txt
 docs/project_memory_for_followup_chat.md
+
+# Local AI/tooling state
+.agents/
+.claude/
+skills-lock.json
+
+# Generated analysis/runtime artifacts
+backend/data/*.jsonl

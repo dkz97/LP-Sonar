@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     eth_rpc_url: str = "https://ethereum.publicnode.com"
     base_rpc_url: str = "https://base.publicnode.com"
     polygon_rpc_url: str = "https://polygon-bor.publicnode.com"
+    bsc_rpc_url: str = "https://bsc-dataseed.bnbchain.org"
 
     # Uniswap V3 subgraph URLs (optional, secondary to RPC)
     # Set these if you have a private Graph node or a paid API key.
@@ -36,6 +37,11 @@ class Settings(BaseSettings):
     uniswap_v3_subgraph_ethereum: str = ""
     uniswap_v3_subgraph_base: str = ""
     uniswap_v3_subgraph_polygon: str = ""
+
+    # Uniswap V4 — The Graph subgraph URLs (optional, requires API key).
+    # Format: https://gateway.thegraph.com/api/{api_key}/subgraphs/id/{subgraph_id}
+    # Without this, V4 pools fall back to on-chain RPC (price/fee/liquidity only, no volume/TVL).
+    uniswap_v4_subgraph_bsc: str = ""
 
     # DeFiLlama (TVL aggregation, optional)
     defillama_api_url: str = "https://yields.llama.fi"

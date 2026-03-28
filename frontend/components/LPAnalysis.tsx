@@ -17,6 +17,7 @@ import {
 import {
   fetchLPRangeRecommendation,
   formatPrice,
+  formatVolume,
   RangeProfile,
   RangeRecommendation,
   Regime,
@@ -560,7 +561,7 @@ export function LPAnalysis({ initialChain = "8453", initialPool = "" }: LPAnalys
             fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "16px",
             color: "var(--text-primary)", marginBottom: "4px",
           }}>
-            LP 区间分析
+            LP Range Analysis
           </div>
           <div style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
             输入 LP 池合约地址，获取保守 / 均衡 / 激进三档价格区间推荐，含预期手续费、IL 风险和 Breach 概率分析

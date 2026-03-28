@@ -88,9 +88,16 @@ _DS_CHAIN: dict[str, str] = {
 
 async def _fetch_pool_state(chain_index: str, pool_address: str) -> dict | None:
     """
-    Fetch pool state from DexScreener by pair address.
-    Returns a normalised dict or None on failure.
+    Fetch pool state by pair address or V4 poolId.
+
+    Routing:
+      - 66-char hex (bytes32) → Uniswap V4 path (subgraph + RPC fallback)
+      - otherwise             → DexScreener path (V2/V3/DLMM)
     """
+    from app.services.univ4_client import is_v4_pool_id, fetch_v4_pool_state
+    if is_v4_pool_id(pool_address):
+        return await fetch_v4_pool_state(chain_index, pool_address)
+
     chain_id = _DS_CHAIN.get(chain_index)
     if not chain_id:
         logger.warning("recommend: unsupported chain_index=%s", chain_index)
@@ -488,6 +495,14 @@ async def recommend_range(
         return result
 
     token_address  = pool["base_token_address"]
+    if not token_address:
+        result = _no_recommendation(
+            "Pool token metadata unavailable for historical analysis. "
+            "For Uniswap V4 poolIds, configure UNISWAP_V4_SUBGRAPH_BSC.",
+        )
+        await _store_cached(chain_index, pool_address, result)
+        return result
+
     pool_age_hours = pool["pool_age_days"] * 24.0
 
     # ── 2. Fetch OHLCV — primary 1H pass ────────────────────────────────

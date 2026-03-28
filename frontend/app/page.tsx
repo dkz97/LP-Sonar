@@ -59,7 +59,7 @@ export default function Dashboard() {
       icon: <Search size={14} />,
       available: true,
     },
-    { id: "lp-analyse",  label: "LP 分析",   icon: <FlaskConical size={14} />, available: true },
+    { id: "lp-analyse",  label: "LP Analysis",   icon: <FlaskConical size={14} />, available: true },
     { id: "ai-chat",     label: "AI Chat",   icon: <MessageSquare size={14} />, available: false },
     { id: "portfolio",   label: "Portfolio", icon: <Wallet size={14} />,        available: false },
   ];
