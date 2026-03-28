@@ -596,6 +596,7 @@ def score_candidate(
         reasons=reasons,
         risk_flags=risk_flags,
         capture_ratio=round(capture, 4),
+        fee_haircut_factor=round(crowding * capture, 4),
     )
 
 

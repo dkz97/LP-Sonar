@@ -177,7 +177,8 @@ class ScoredRange:
     utility_score: float        # final composite (higher is better)
     reasons: list = field(default_factory=list)
     risk_flags: list = field(default_factory=list)
-    capture_ratio: float = 1.0  # P2.3.3: competitive fee capture factor (vol/TVL-driven)
+    capture_ratio: float = 1.0      # P2.3.3: competitive fee capture factor (vol/TVL-driven)
+    fee_haircut_factor: float = 1.0 # P2.5: total fee discount = width_f × tvl_f × capture_ratio (all three layers combined)
 
 
 class RangeProfile(BaseModel):

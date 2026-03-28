@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Backend Validation Script — LP Range Recommendation Engine Phase 1.5 / P2.3.2
+Backend Validation Script — LP Range Recommendation Engine Phase 1.5 / P2.5
 
 Sections:
   A. Pure-logic unit tests (no network)
@@ -8,6 +8,7 @@ Sections:
   C. Young-pool simulation (patched pool_state)
   D. Rejection cases
   E. P2.3.2 CEX/DEX divergence signal
+  J. P2.5 Phase 1 — expected_net_pnl fee haircut alignment
 
 Usage:
   cd /Users/zhangjiajun/LP-Sonar/backend
@@ -2621,6 +2622,177 @@ def test_regime_uncertainty_breach_penalty() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# J. P2.5 Phase 1 — expected_net_pnl realism alignment (fee haircut)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_net_pnl_haircut() -> None:
+    section("J. P2.5 Phase 1 — expected_net_pnl fee haircut alignment")
+
+    from app.models.schemas import (
+        BacktestResult, CandidateRange, ILRiskResult,
+        MarketQualityResult, RegimeResult,
+    )
+    from app.services.range_scorer import score_candidate
+    from app.services.range_recommender import _scored_to_profile
+
+    # ── Shared helpers ─────────────────────────────────────────────────────────
+    def _bt(fee_proxy: float = 0.010, il: float = -0.003) -> BacktestResult:
+        return BacktestResult(
+            in_range_time_ratio=0.80,
+            cumulative_fee_proxy=fee_proxy,
+            il_cost_proxy=il,
+            first_breach_bar=None,
+            breach_count=1,
+            rebalance_count=1,
+            realized_net_pnl_proxy=round(fee_proxy + il, 8),
+        )
+
+    def _cand(width_pct: float = 0.10) -> CandidateRange:
+        c = 100.0; h = c * width_pct / 2.0
+        return CandidateRange(
+            lower_price=c - h, upper_price=c + h,
+            lower_tick=int(-h * 10), upper_tick=int(h * 10),
+            width_pct=width_pct, center_price=c, range_type="volatility_band",
+        )
+
+    def _quality(vol_tvl: float = 2.0) -> MarketQualityResult:
+        return MarketQualityResult(
+            pool_address="0xTEST", wash_risk="low", wash_score=0.10,
+            vol_tvl_ratio=vol_tvl, imbalance_ratio=0.5, avg_trade_size_usd=500.0,
+        )
+
+    def _regime() -> RegimeResult:
+        return RegimeResult(
+            regime="range_bound", confidence=0.85,
+            realized_vol=0.60, drift_slope=0.0, jump_ratio=0.05,
+        )
+
+    il_result = ILRiskResult(level="low", score=20, main_driver="low_vol")
+
+    # ── J1: fee_haircut_factor field exists on ScoredRange ────────────────────
+    s = score_candidate(
+        _cand(0.10), _bt(), il_result, _quality(vol_tvl=2.0), _regime(),
+        tvl_usd=5_000_000, horizon_bars=48,
+    )
+    check(hasattr(s, "fee_haircut_factor"),
+          "J1: ScoredRange carries fee_haircut_factor field")
+    check(0.0 < s.fee_haircut_factor <= 1.0,
+          "J1: fee_haircut_factor ∈ (0, 1]",
+          f"got={s.fee_haircut_factor:.4f}")
+
+    # ── J2: fee_haircut_factor = width_f × tvl_f × capture (arithmetic) ──────
+    # Cross-check: fee_haircut_factor × fee_raw ≈ fee_score
+    # fee_score = fee_raw × haircut; fee_raw is not exposed but:
+    # capture_ratio × crowding_from_width_and_tvl = fee_haircut_factor
+    # Verify: capture_ratio is a factor of fee_haircut_factor
+    check(s.fee_haircut_factor <= s.capture_ratio + 1e-9,
+          "J2: fee_haircut_factor ≤ capture_ratio (crowding only adds more discount)",
+          f"haircut={s.fee_haircut_factor:.4f} capture={s.capture_ratio:.4f}")
+    # fee_haircut_factor < 1 for any non-trivial pool
+    s_big = score_candidate(
+        _cand(0.10), _bt(), il_result, _quality(vol_tvl=3.0), _regime(),
+        tvl_usd=100_000_000, horizon_bars=48,
+    )
+    check(s_big.fee_haircut_factor < s.fee_haircut_factor,
+          "J2: larger TVL + higher vol/TVL → smaller fee_haircut_factor",
+          f"big={s_big.fee_haircut_factor:.4f} base={s.fee_haircut_factor:.4f}")
+
+    # ── J3: expected_net_pnl < raw proxy for high-competition pool ────────────
+    # Use _scored_to_profile directly (no network); position_usd=0 skips exec cost
+    profile = _scored_to_profile(s, horizon_bars=48, tvl_usd=5_000_000)
+    bt = s.backtest
+    raw_net_pnl = bt.realized_net_pnl_proxy       # old raw formula
+    honest_net_pnl = profile.expected_net_pnl     # new haircut formula
+    check(honest_net_pnl < raw_net_pnl,
+          "J3: expected_net_pnl (haircut) < raw realized_net_pnl_proxy",
+          f"honest={honest_net_pnl:.6f} raw={raw_net_pnl:.6f}")
+
+    # ── J4: IL component not touched — delta = fee × (1 - haircut) ────────────
+    # honest_net = fee × haircut + il
+    # raw_net    = fee + il
+    # delta      = fee × (1 - haircut)   → exactly the fee overstatement we removed
+    expected_delta = round(bt.cumulative_fee_proxy * (1.0 - s.fee_haircut_factor), 8)
+    actual_delta   = round(raw_net_pnl - honest_net_pnl, 8)
+    check(abs(actual_delta - expected_delta) < 1e-7,
+          "J4: net_pnl delta = fee_proxy × (1 − haircut)  [IL untouched]",
+          f"actual={actual_delta:.8f} expected={expected_delta:.8f}")
+    # IL item is preserved: honest_net + fee_drop = raw_net → il unchanged
+    il_from_honest = honest_net_pnl - bt.cumulative_fee_proxy * s.fee_haircut_factor
+    check(abs(il_from_honest - bt.il_cost_proxy) < 1e-7,
+          "J4: IL component unchanged (b.il_cost_proxy passes through intact)",
+          f"il_from_formula={il_from_honest:.8f} bt.il={bt.il_cost_proxy:.8f}")
+
+    # ── J5: execution_cost_fraction still deducted correctly ──────────────────
+    # Force a non-zero exec cost via rebalance_count > 0 + chain_index="eth"
+    # Use position_usd=10_000 to trigger execution cost computation
+    bt_rebal = BacktestResult(
+        in_range_time_ratio=0.70, cumulative_fee_proxy=0.010, il_cost_proxy=-0.003,
+        first_breach_bar=10, breach_count=3, rebalance_count=3,
+        realized_net_pnl_proxy=0.007,
+    )
+    s_rebal = score_candidate(
+        _cand(0.10), bt_rebal, il_result, _quality(vol_tvl=1.0), _regime(),
+        tvl_usd=2_000_000, horizon_bars=48, chain_index="eth", position_usd=10_000,
+    )
+    profile_with_cost = _scored_to_profile(
+        s_rebal, horizon_bars=48, tvl_usd=2_000_000,
+        chain_index="eth", position_usd=10_000,
+    )
+    profile_no_cost   = _scored_to_profile(
+        s_rebal, horizon_bars=48, tvl_usd=2_000_000,
+        chain_index="eth", position_usd=0,
+    )
+    check(profile_with_cost.expected_net_pnl < profile_no_cost.expected_net_pnl,
+          "J5: exec cost deducted from expected_net_pnl (with_cost < no_cost)",
+          f"with={profile_with_cost.expected_net_pnl:.6f} no={profile_no_cost.expected_net_pnl:.6f}")
+    check(profile_with_cost.execution_cost_fraction is not None
+          and profile_with_cost.execution_cost_fraction > 0,
+          "J5: execution_cost_fraction field non-zero when position_usd provided")
+
+    # ── J6: expected_fee_apr unchanged (not affected by this change) ───────────
+    # expected_fee_apr = scored.fee_score × 3.0 — unchanged by net_pnl fix
+    profile_a = _scored_to_profile(s, horizon_bars=48, tvl_usd=5_000_000)
+    expected_apr = round(s.fee_score * 3.0, 4)
+    check(abs(profile_a.expected_fee_apr - expected_apr) < 1e-6,
+          "J6: expected_fee_apr unchanged (still = scored.fee_score × 3.0)",
+          f"profile_apr={profile_a.expected_fee_apr:.4f} expected={expected_apr:.4f}")
+
+    # ── J7: scenario_pnl passes through unchanged (no haircut applied) ────────
+    mock_scenario = {"sideways": 0.005, "slow_up": 0.009, "slow_down": -0.002}
+    profile_sc = _scored_to_profile(
+        s, horizon_bars=48, tvl_usd=5_000_000, scenario_pnl=mock_scenario,
+    )
+    check(profile_sc.scenario_pnl == mock_scenario,
+          "J7: scenario_pnl passes through unchanged (raw proxy, P2.5 Phase 2 deferred)",
+          f"got={profile_sc.scenario_pnl}")
+
+    # ── J8: quiet pool (haircut ≈ 1) → expected_net_pnl ≈ raw proxy ──────────
+    s_quiet = score_candidate(
+        _cand(0.30), _bt(fee_proxy=0.005, il=-0.001), il_result,
+        _quality(vol_tvl=0.05), _regime(),
+        tvl_usd=100_000, horizon_bars=48,
+    )
+    profile_quiet = _scored_to_profile(s_quiet, horizon_bars=48, tvl_usd=100_000)
+    raw_quiet = s_quiet.backtest.realized_net_pnl_proxy
+    # For very quiet pool (vol/TVL≈0), capture→1.0, small TVL→tvl_f=1.0
+    # fee_haircut_factor ≈ width_factor(0.30) ≈ 0.997 → almost no haircut
+    # vol/TVL=0.05 → capture≈0.942; width(0.30)→width_f≈0.997; TVL=$100K→tvl_f=1.0
+    # combined ≈ 0.94 — well above 0.90, confirming minimal competition discount
+    check(s_quiet.fee_haircut_factor > 0.90,
+          "J8: quiet small pool → fee_haircut_factor close to 1.0 (>0.90)",
+          f"got={s_quiet.fee_haircut_factor:.4f}")
+    check(abs(profile_quiet.expected_net_pnl - raw_quiet) < 0.001,
+          "J8: quiet pool expected_net_pnl ≈ raw proxy (haircut ~1)",
+          f"honest={profile_quiet.expected_net_pnl:.6f} raw={raw_quiet:.6f}")
+
+    # ── J9: API backward compat — field name and type unchanged ───────────────
+    check(isinstance(profile_a.expected_net_pnl, float),
+          "J9: expected_net_pnl field is still float (type unchanged)")
+    check(isinstance(profile_sc.scenario_pnl, dict),
+          "J9: scenario_pnl field is still dict (type unchanged)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2681,6 +2853,9 @@ async def main() -> None:
 
     # ── I. P2.4.1 Regime confidence → breach inflation ────────────────────────
     test_regime_uncertainty_breach_penalty()
+
+    # ── J. P2.5 Phase 1 — expected_net_pnl fee haircut alignment ──────────────
+    test_net_pnl_haircut()
 
     # ── Summary ───────────────────────────────────────────────────────────────
     elapsed = time.time() - t0

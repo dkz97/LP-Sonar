@@ -286,8 +286,18 @@ def _scored_to_profile(
         )
         exec_cost_frac = _exec_total(b.rebalance_count, chain_index, position_usd, tvl_usd)
 
-    # Net PnL: subtract execution cost from backtest proxy (backtest layer stays pure)
-    net_pnl = b.realized_net_pnl_proxy - (exec_cost_frac or 0.0)
+    # P2.5 Phase 1: apply the same three-layer fee haircut to net PnL as to expected_fee_apr.
+    #
+    # Consistency guarantee:
+    #   expected_fee_apr  ← haircut-aware (width_f × tvl_f × capture) since P2.2.2 + P2.3.3
+    #   expected_net_pnl  ← haircut-aware (this change, P2.5 Phase 1)
+    #   scenario_pnl      ← still raw replay proxy (deferred to P2.5 Phase 2)
+    #
+    # Only the fee component is discounted. IL is driven by price path, not LP competition,
+    # so b.il_cost_proxy passes through unchanged. The backtester layer remains pure:
+    # b.cumulative_fee_proxy is still raw replay output; we apply the discount here.
+    fee_haircut = getattr(scored, "fee_haircut_factor", 1.0)
+    net_pnl = b.cumulative_fee_proxy * fee_haircut + b.il_cost_proxy - (exec_cost_frac or 0.0)
 
     # Risk flag for notable execution cost (> 0.5% of capital)
     risk_flags_out = list(scored.risk_flags)
