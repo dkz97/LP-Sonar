@@ -2150,6 +2150,105 @@ async def test_cex_dex_divergence() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# F. P2.2.2 Crowding Factor
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_crowding_factor() -> None:
+    section("F. P2.2.2 Crowding Factor (fee capture haircut)")
+    from app.models.schemas import (
+        BacktestResult, CandidateRange, ILRiskResult,
+        MarketQualityResult, RegimeResult,
+    )
+    from app.services.range_scorer import score_candidate, _fee_capture_efficiency
+
+    il = ILRiskResult(level="medium", score=40, main_driver="vol")
+    quality = MarketQualityResult(
+        pool_address="0xTEST", wash_risk="low", wash_score=0.1,
+        vol_tvl_ratio=0.1, imbalance_ratio=0.5, avg_trade_size_usd=500.0,
+    )
+    regime = RegimeResult(
+        regime="range_bound", confidence=0.75,
+        realized_vol=0.60, drift_slope=0.0, jump_ratio=0.05,
+    )
+
+    def _bt():
+        return BacktestResult(
+            in_range_time_ratio=0.80, cumulative_fee_proxy=0.05,
+            il_cost_proxy=-0.02, first_breach_bar=30,
+            breach_count=1, rebalance_count=0, realized_net_pnl_proxy=0.03,
+        )
+
+    def _cand(width_pct: float) -> CandidateRange:
+        c = 100.0; h = c * width_pct / 2.0
+        return CandidateRange(
+            lower_price=c - h, upper_price=c + h,
+            lower_tick=int(-h * 10), upper_tick=int(h * 10),
+            width_pct=width_pct, center_price=c, range_type="volatility_band",
+        )
+
+    # ── Curve checks ──────────────────────────────────────────────────────────
+    check(_fee_capture_efficiency(0.0) == 0.50,  "Floor at width=0 → 0.50")
+    check(_fee_capture_efficiency(0.04) == 0.75, "Midpoint at width=0.04 → 0.75")
+    check(_fee_capture_efficiency(0.40) > 0.98,  "Wide range > 0.98")
+    widths = [0.005, 0.01, 0.05, 0.10, 0.20, 0.40]
+    effs   = [_fee_capture_efficiency(w) for w in widths]
+    check(all(effs[i] <= effs[i+1] for i in range(len(effs)-1)),
+          "Efficiency monotonically increases with width",
+          " ".join(f"{e:.3f}" for e in effs))
+
+    # ── Case 1: wide range — nearly no discount ────────────────────────────
+    s_wide = score_candidate(_cand(0.40), _bt(), il, quality, regime,
+                             tvl_usd=500_000, horizon_bars=48)
+    check(_fee_capture_efficiency(0.40) > 0.98,
+          "Case 1: wide (0.40) efficiency > 0.98")
+    check(s_wide.utility_score > 0.05,
+          "Case 1: wide utility remains usable", f"utility={s_wide.utility_score:.4f}")
+
+    # ── Case 2: medium range — light discount ────────────────────────────
+    s_med = score_candidate(_cand(0.10), _bt(), il, quality, regime,
+                            tvl_usd=500_000, horizon_bars=48)
+    f_med = _fee_capture_efficiency(0.10)
+    check(0.82 < f_med < 0.92,
+          "Case 2: medium (0.10) efficiency 0.82–0.92", f"got={f_med:.4f}")
+    check(s_med.fee_score < s_wide.fee_score,
+          "Case 2: medium fee_score < wide fee_score",
+          f"med={s_med.fee_score:.4f} wide={s_wide.fee_score:.4f}")
+
+    # ── Case 3: very narrow — strong discount ────────────────────────────
+    s_narrow = score_candidate(_cand(0.01), _bt(), il, quality, regime,
+                               tvl_usd=500_000, horizon_bars=48)
+    f_narrow = _fee_capture_efficiency(0.01)
+    check(f_narrow < 0.75,
+          "Case 3: narrow (0.01) efficiency < 0.75", f"got={f_narrow:.4f}")
+    haircut = (1.0 - f_narrow) * 100
+    check(haircut > 20,
+          "Case 3: haircut > 20% for very narrow range", f"haircut={haircut:.1f}%")
+    check(s_narrow.fee_score < s_med.fee_score,
+          "Case 3: narrow fee_score < medium fee_score",
+          f"narrow={s_narrow.fee_score:.4f} med={s_med.fee_score:.4f}")
+
+    # ── Case 4: aggressive > conservative crowding ────────────────────────
+    s_agg  = score_candidate(_cand(0.02), _bt(), il, quality, regime,
+                             tvl_usd=500_000, horizon_bars=48)
+    s_cons = score_candidate(_cand(0.30), _bt(), il, quality, regime,
+                             tvl_usd=500_000, horizon_bars=48)
+    check(_fee_capture_efficiency(0.02) < _fee_capture_efficiency(0.30),
+          "Case 4: aggressive efficiency < conservative efficiency",
+          f"agg={_fee_capture_efficiency(0.02):.4f} cons={_fee_capture_efficiency(0.30):.4f}")
+    check(s_agg.fee_score < s_cons.fee_score,
+          "Case 4: aggressive fee_score < conservative fee_score",
+          f"agg={s_agg.fee_score:.4f} cons={s_cons.fee_score:.4f}")
+
+    # ── Case 5: no collapse ───────────────────────────────────────────────
+    for w, label in [(0.01, "very_narrow"), (0.05, "narrow"), (0.25, "wide")]:
+        s = score_candidate(_cand(w), _bt(), il, quality, regime,
+                            tvl_usd=500_000, horizon_bars=48)
+        check(s.utility_score >= 0.0,
+              f"Case 5: {label} utility >= 0 (no collapse)",
+              f"utility={s.utility_score:.4f}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2198,6 +2297,9 @@ async def main() -> None:
 
     # ── E. P2.3.2 CEX/DEX divergence signal ──────────────────────────────────
     await test_cex_dex_divergence()
+
+    # ── F. P2.2.2 Crowding factor ─────────────────────────────────────────────
+    test_crowding_factor()
 
     # ── Summary ───────────────────────────────────────────────────────────────
     elapsed = time.time() - t0

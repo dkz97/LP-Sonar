@@ -1,7 +1,7 @@
 """
 Range Scorer: computes utility score for each candidate range.
 
-Score(r) = w_fee * FeeScore(r)
+Score(r) = w_fee * FeeScore(r) * crowding_factor(width)
          - w_il  * ILScore(r)
          - w_breach * BreachRisk(r)
          - w_rebalance * RebalanceCost(r)
@@ -16,6 +16,12 @@ Default weights (configurable via config.py):
   breach    0.25
   rebalance 0.10
   quality   0.10
+
+P2.2.2 — Crowding factor (fee capture haircut):
+  Concentrated ranges compete with other LPs at the same tick band.
+  Narrower ranges = more crowded = lower fraction of theoretical fee captured.
+  crowding_factor ∈ [_CROWDING_FLOOR, 1.0] applied to fee_score only.
+  Does NOT affect il_score / breach_risk / rebalance_cost (no double-counting).
 """
 from __future__ import annotations
 import logging
@@ -49,6 +55,23 @@ DEFAULT_WEIGHTS: dict[str, float] = {
 _FEE_SCORE_FULL_APR = 3.0       # 300% APR → FeeScore = 1.0
 _REBALANCE_COST_PER_EVENT = 0.001  # 0.1% of capital per rebalance (rough gas + slippage)
 _BARS_PER_YEAR = 8760.0         # 1h bars per year
+
+# ── P2.2.2: Crowding factor constants ────────────────────────────────────────
+# Fee capture efficiency: fraction of theoretical fee that actually reaches the LP
+# after accounting for competing LPs crowding the same tick band.
+# Phase 1 proxy: range width only (no on-chain tick liquidity data required).
+#
+# Sigmoid curve: capture = FLOOR + (1-FLOOR) × σ(STEEPNESS × (width_pct - INFLECTION))
+#
+# Calibrated reference points (with defaults below):
+#   width_pct 0.010 (±0.5%):  ≈ 0.68  [32% haircut — very narrow, maximum crowding]
+#   width_pct 0.040 (±2%):    = 0.75  [25% haircut — narrow, crowded tick band]
+#   width_pct 0.100 (±5%):    ≈ 0.88  [12% haircut — medium, moderate competition]
+#   width_pct 0.200 (±10%):   ≈ 0.98  [ 2% haircut — wide, minimal crowding]
+#   width_pct 0.400+:         ≈ 1.00  [  ~0% haircut — full-range-like, no crowding]
+_CROWDING_FLOOR      = 0.50   # minimum capture ratio (ultra-narrow asymptote)
+_CROWDING_INFLECTION = 0.04   # width_pct where capture = (FLOOR + 1) / 2 = 0.75
+_CROWDING_STEEPNESS  = 20.0   # steepness of sigmoid transition
 
 
 # ── Analytical terminal OOR helpers (P2.2.3) ───────────────────────────────
@@ -139,6 +162,31 @@ def compute_blended_oor(
 
     blended = replay_weight * replay_oor + (1.0 - replay_weight) * analytical
     return round(max(0.0, min(1.0, blended)), 4)
+
+
+def _fee_capture_efficiency(width_pct: float) -> float:
+    """
+    Crowding discount for fee capture efficiency (P2.2.2 Phase 1).
+
+    Accounts for competing LPs concentrating at the same narrow tick band,
+    which reduces actual fee capture vs the theoretical maximum.
+
+    Uses a sigmoid curve parameterised by module constants:
+        capture = FLOOR + (1 - FLOOR) × σ(STEEPNESS × (width_pct - INFLECTION))
+
+    Returns a multiplier in [_CROWDING_FLOOR, 1.0].
+    Applied only to fee_score — does NOT affect IL, breach, or rebalance terms.
+
+    Phase 2 upgrade path: incorporate pool TVL and vol/TVL as secondary modifiers
+    (larger TVL → more LP competition → lower capture for same width).
+    """
+    if width_pct <= 0:
+        return _CROWDING_FLOOR
+    x = _CROWDING_STEEPNESS * (max(width_pct, 0.0) - _CROWDING_INFLECTION)
+    # Clamp x to avoid fp overflow on extreme inputs (|x| > 500 → sigmoid ≈ 0 or 1)
+    x = max(-500.0, min(500.0, x))
+    sigmoid = 1.0 / (1.0 + math.exp(-x))
+    return _CROWDING_FLOOR + (1.0 - _CROWDING_FLOOR) * sigmoid
 
 
 def _fee_score(backtest: BacktestResult, horizon_bars: int, bars_per_year: float = 8760.0) -> float:
@@ -310,6 +358,13 @@ def score_candidate(
     w = weights or DEFAULT_WEIGHTS
 
     fee_s = _fee_score(backtest, horizon_bars)
+    # P2.2.2: crowding discount — narrow ranges face more LP competition at the same tick band
+    crowding = _fee_capture_efficiency(candidate.width_pct)
+    fee_s = round(fee_s * crowding, 4)
+    logger.debug(
+        "scorer: pool crowding width_pct=%.4f crowding=%.3f fee_s=%.4f",
+        candidate.width_pct, crowding, fee_s,
+    )
     il_s = _il_score(backtest, il_result)
     breach_r = _breach_risk(
         backtest, regime_result, candidate, horizon_bars,
