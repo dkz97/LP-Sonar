@@ -33,6 +33,28 @@ _AVG_TRADE_SMALL  = 50.0   # < $50    → small trades warning
 # TVL floor for adequate depth
 _MIN_TVL_DEPTH = 100_000
 
+# ── P2.5.x Phase 1: burst-cap constants ──────────────────────────────────────
+# Raise vol_tvl_ratio when the pool is "heating NOW" but 24h snapshot hasn't
+# caught up yet. Only fires when the 1h annualized rate >> 24h baseline rate.
+#
+#   annualized_1h = volume_1h × 24 / tvl_usd   (24h equivalent if current pace continues)
+#   trigger when:  annualized_1h > vol_tvl × _BURST_MULTIPLE
+#   blend formula: vol_tvl = (vol_tvl + annualized_1h × W) / (1 + W)
+#
+# Design choices:
+#   BURST_MULTIPLE = 3.0 — current hour must be 3× the 24h average pace to trigger.
+#     A pool with perfectly uniform vol would have annualized_1h == vol_tvl (1.0×);
+#     3× means current pace is meaningfully elevated, not just random fluctuation.
+#   BURST_WEIGHT   = 0.40 — 24h retains weight 1/(1+0.40) ≈ 71%, 1h gets 29%.
+#     Conservative blend: the burst signal nudges vol_tvl up, does not replace it.
+#
+# Asymmetry:
+#   Direction: ONE-WAY only (only raises, never lowers vol_tvl_ratio).
+#   "Was hot yesterday, quiet now" is the safe direction (over-haircuts capture).
+#   "Just went hot" is the dangerous direction this corrects (prevents over-optimism).
+_BURST_MULTIPLE = 3.0
+_BURST_WEIGHT   = 0.40
+
 
 def detect_market_quality(
     pool_address: str,
@@ -119,6 +141,22 @@ def detect_market_quality(
         wash_risk = "medium"
     else:
         wash_risk = "low"
+
+    # ── Burst-cap (P2.5.x Phase 1): raise vol_tvl for competitive capture ─────
+    # Placed AFTER all wash-flag scoring (steps 1–5) so wash_score / wash_risk /
+    # flags are always computed from the raw 24h vol_tvl.
+    # vol_tvl_1h used by EXTREME_1H_TURNOVER is a separate variable, unaffected.
+    #
+    # If the current 1h pace (annualized) is >= BURST_MULTIPLE × the 24h rate,
+    # the pool is heating NOW and the 24h snapshot understates LP competition.
+    # Conservative upward blend corrects the most dangerous failure mode:
+    # recommending LP entry just as competition is surging.
+    #
+    # Fail-safe: does not trigger when volume_1h == 0 or volume_24h == 0.
+    if volume_1h > 0 and volume_24h > 0:
+        annualized_1h = (volume_1h * 24.0) / max(tvl_usd, 1.0)
+        if annualized_1h > vol_tvl * _BURST_MULTIPLE:
+            vol_tvl = (vol_tvl + annualized_1h * _BURST_WEIGHT) / (1.0 + _BURST_WEIGHT)
 
     return MarketQualityResult(
         pool_address=pool_address,

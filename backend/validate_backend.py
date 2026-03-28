@@ -9,6 +9,7 @@ Sections:
   D. Rejection cases
   E. P2.3.2 CEX/DEX divergence signal
   J. P2.5 Phase 1 — expected_net_pnl fee haircut alignment
+  K. P2.5.x Phase 1 — vol/TVL burst-cap (snapshot quality)
 
 Usage:
   cd /Users/zhangjiajun/LP-Sonar/backend
@@ -2792,6 +2793,78 @@ def test_net_pnl_haircut() -> None:
           "J9: scenario_pnl field is still dict (type unchanged)")
 
 
+def test_vol_tvl_burst_cap():
+    """
+    K. P2.5.x Phase 1 — vol/TVL burst-cap
+
+    Verifies that detect_market_quality() raises vol_tvl_ratio conservatively
+    when the pool is "heating NOW" (1h annualized rate >> 24h rate), without
+    touching wash detection logic or affecting any other output field.
+
+    All test numbers chosen to be analytically exact:
+      TVL=1_000_000, vol_24h=300_000 → vol_tvl_24h = 0.300
+      vol_1h=100_000 → annualized_1h = 2.400
+      threshold = 0.300 × 3.0 = 0.900; 2.400 > 0.900 → triggered
+      blended = (0.300 + 2.400×0.40) / 1.40 = 1.260 / 1.40 = 0.900
+
+    Six checks:
+      K1 — burst triggered: vol_tvl_ratio rises above 24h baseline
+      K2 — below threshold: vol_tvl_ratio unchanged
+      K3 — fail-safe vol_1h=0: vol_tvl_ratio = 24h baseline
+      K4 — burst → capture_ratio more conservative (lower)
+      K5 — wash_risk determined before burst-cap; unaffected by burst
+      K6 — fail-safe vol_24h=0 (fresh pool): no trigger
+    """
+    section("K. P2.5.x Phase 1 — vol/TVL burst-cap")
+    from app.services.market_quality import detect_market_quality, _BURST_MULTIPLE, _BURST_WEIGHT
+    from app.services.range_scorer import _competitive_capture_ratio
+
+    TVL     = 1_000_000.0
+    VOL_24H = 300_000.0   # → vol_tvl_24h = 0.300
+
+    # ── K1: burst triggered → vol_tvl_ratio > 24h baseline 0.300 ────────────
+    # vol_1h=100K: annualized_1h = 100K×24/1M = 2.400 > 0.300×3 = 0.900 → fire
+    # blended = (0.300 + 2.400×0.40) / 1.40 = 0.900
+    q_burst = detect_market_quality("0xT", TVL, VOL_24H, 100_000, 50_000, 50_000, 50)
+    check(q_burst.vol_tvl_ratio > 0.300,
+          "K1 burst triggered: vol_tvl_ratio > 24h baseline 0.300",
+          f"vol_tvl_ratio={q_burst.vol_tvl_ratio}")
+
+    # ── K2: below threshold → vol_tvl_ratio unchanged at 0.300 ──────────────
+    # vol_1h=10K: annualized_1h = 0.240 ≤ 0.900 → not triggered
+    q_quiet = detect_market_quality("0xT", TVL, VOL_24H, 10_000, 50_000, 50_000, 50)
+    check(q_quiet.vol_tvl_ratio == 0.3,
+          "K2 below threshold: vol_tvl_ratio unchanged at 0.300",
+          f"vol_tvl_ratio={q_quiet.vol_tvl_ratio}")
+
+    # ── K3: fail-safe vol_1h=0 → vol_tvl_ratio = 24h baseline ───────────────
+    q_no1h = detect_market_quality("0xT", TVL, VOL_24H, 0, 50_000, 50_000, 0)
+    check(q_no1h.vol_tvl_ratio == 0.3,
+          "K3 fail-safe vol_1h=0: vol_tvl_ratio = 24h baseline 0.300",
+          f"vol_tvl_ratio={q_no1h.vol_tvl_ratio}")
+
+    # ── K4: burst → capture_ratio more conservative (lower than quiet) ───────
+    capture_burst = _competitive_capture_ratio(q_burst.vol_tvl_ratio)
+    capture_quiet = _competitive_capture_ratio(q_quiet.vol_tvl_ratio)
+    check(capture_burst < capture_quiet,
+          "K4 burst → capture_ratio < baseline (more conservative haircut)",
+          f"capture_burst={capture_burst:.4f} < capture_quiet={capture_quiet:.4f}")
+
+    # ── K5: wash_risk determined pre-burst; unaffected by burst ──────────────
+    # vol_tvl_24h = 0.300 < _VOL_TVL_WARN (10.0) → no HIGH_VOL_TVL flag
+    # → wash_risk = "low" regardless of burst raising vol_tvl_ratio to 0.900
+    check(q_burst.wash_risk == "low",
+          "K5 wash_risk unaffected by burst: 'low' for vol_tvl_24h=0.300 (<10)",
+          f"wash_risk={q_burst.wash_risk}")
+
+    # ── K6: fail-safe vol_24h=0 (fresh pool) → no trigger ───────────────────
+    # Burst guard: volume_24h > 0 fails → vol_tvl_ratio = 0.000
+    q_fresh = detect_market_quality("0xT", TVL, 0, 50_000, 25_000, 25_000, 100)
+    check(q_fresh.vol_tvl_ratio == 0.0,
+          "K6 fail-safe vol_24h=0: no burst trigger on fresh pool",
+          f"vol_tvl_ratio={q_fresh.vol_tvl_ratio}")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2856,6 +2929,9 @@ async def main() -> None:
 
     # ── J. P2.5 Phase 1 — expected_net_pnl fee haircut alignment ──────────────
     test_net_pnl_haircut()
+
+    # ── K. P2.5.x Phase 1 — vol/TVL burst-cap ─────────────────────────────────
+    test_vol_tvl_burst_cap()
 
     # ── Summary ───────────────────────────────────────────────────────────────
     elapsed = time.time() - t0
