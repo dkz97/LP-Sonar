@@ -526,6 +526,7 @@ def score_candidate(
         utility_score=utility,
         reasons=reasons,
         risk_flags=risk_flags,
+        capture_ratio=round(capture, 4),
     )
 
 

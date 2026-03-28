@@ -274,6 +274,9 @@ def _scored_to_profile(
     # Use shrunk fee APR for display if provided (young pool)
     display_fee_apr = shrunk_fee_apr if shrunk_fee_apr is not None else expected_fee_apr
 
+    # P2.3.3: competitive capture ratio — carry through from scorer for transparency
+    competitive_capture_ratio = getattr(scored, "capture_ratio", None)
+
     # P2.3.1: Execution cost — compute fraction and deduct from net PnL display
     exec_cost_frac: Optional[float] = None
     if position_usd > 0:
@@ -323,6 +326,8 @@ def _scored_to_profile(
         young_pool_adjustments=young_pool_adjustments or [],
         # P2.3.1
         execution_cost_fraction=round(exec_cost_frac, 6) if exec_cost_frac is not None else None,
+        # P2.3.3
+        competitive_capture_ratio=round(competitive_capture_ratio, 4) if competitive_capture_ratio is not None else None,
     )
 
 
