@@ -57,13 +57,18 @@ _REBALANCE_COST_PER_EVENT = 0.001  # 0.1% of capital per rebalance (rough gas + 
 _BARS_PER_YEAR = 8760.0         # 1h bars per year
 
 # ── P2.2.2: Crowding factor constants ────────────────────────────────────────
-# Fee capture efficiency: fraction of theoretical fee that actually reaches the LP
-# after accounting for competing LPs crowding the same tick band.
-# Phase 1 proxy: range width only (no on-chain tick liquidity data required).
+# Fee capture efficiency = width_factor × tvl_factor
 #
-# Sigmoid curve: capture = FLOOR + (1-FLOOR) × σ(STEEPNESS × (width_pct - INFLECTION))
+# Combined captures two independent crowding dimensions:
+#   width_factor — how congested this specific tick band is (Phase 1)
+#   tvl_factor   — how many LPs are in the pool competing (Phase 2)
 #
-# Calibrated reference points (with defaults below):
+# Both are multiplicative because they model independent probability fractions:
+# "P(you capture volume | price in range) = P(not out-crowded by width) × P(not out-crowded by TVL)"
+#
+# ── Phase 1: width-based sigmoid ─────────────────────────────────────────────
+# capture_width = FLOOR + (1-FLOOR) × σ(STEEPNESS × (width_pct - INFLECTION))
+#
 #   width_pct 0.010 (±0.5%):  ≈ 0.68  [32% haircut — very narrow, maximum crowding]
 #   width_pct 0.040 (±2%):    = 0.75  [25% haircut — narrow, crowded tick band]
 #   width_pct 0.100 (±5%):    ≈ 0.88  [12% haircut — medium, moderate competition]
@@ -72,6 +77,55 @@ _BARS_PER_YEAR = 8760.0         # 1h bars per year
 _CROWDING_FLOOR      = 0.50   # minimum capture ratio (ultra-narrow asymptote)
 _CROWDING_INFLECTION = 0.04   # width_pct where capture = (FLOOR + 1) / 2 = 0.75
 _CROWDING_STEEPNESS  = 20.0   # steepness of sigmoid transition
+
+# ── Phase 2: TVL-based log-linear discount ────────────────────────────────────
+# Larger TVL pools attract more LPs competing at the same tick bands.
+# LP density ~ log(TVL), so fee capture discount scales with log10(tvl / TVL_REF).
+#
+# tvl_factor = clip(1.0 - TVL_DECAY × max(0, log10(tvl_usd / TVL_REF)), TVL_FLOOR, 1.0)
+#
+# Design choices:
+#   - Upper-capped at 1.0: small pools (TVL < REF) do NOT get a boost above Phase 1 baseline.
+#     Phase 1 already assumed "average" competition; small pools don't deserve extra credit.
+#   - Floor at 0.85: even a $1B+ pool gets at most a 15% additional discount from TVL alone.
+#     Prevents extreme penalisation of flagship pools.
+#   - TVL_REF = $1M: the neutral anchor. Most mid-size pools sit here; effect kicks in above.
+#   - TVL_DECAY = 0.05: 5% additional discount per order of magnitude above $1M.
+#     $10M → 0.95, $100M → 0.90, $1B → 0.85 (floor)
+#
+# Combined floor: 0.50 (width) × 0.85 (TVL) = 0.425 at the theoretical extreme
+# (ultra-narrow range in a $1B+ pool). In practice narrowest seen range ≈ 0.68 × 0.85 = 0.58.
+_TVL_REF   = 1_000_000.0   # $1M — neutral TVL, factor = 1.0
+_TVL_DECAY = 0.05           # per-decade discount above TVL_REF
+_TVL_FLOOR = 0.85           # minimum TVL factor (even for $1B+ pools)
+
+
+def _tvl_crowding_factor(tvl_usd: float) -> float:
+    """
+    TVL-based crowding discount for fee capture efficiency (P2.2.2 Phase 2).
+
+    Larger TVL pools attract more LP competition at the same tick bands,
+    reducing actual fee capture below the width-only Phase 1 estimate.
+
+    Formula:
+        tvl_factor = clip(1.0 - TVL_DECAY × max(0, log10(tvl_usd / TVL_REF)),
+                          TVL_FLOOR, 1.0)
+
+    Properties:
+        tvl_usd <= TVL_REF  → factor = 1.0  (no boost for small/medium pools)
+        tvl_usd = $10M      → factor = 0.95  (5% additional discount)
+        tvl_usd = $100M     → factor = 0.90  (10% additional discount)
+        tvl_usd = $1B+      → factor = 0.85  (floor, 15% maximum discount)
+
+    Returns 1.0 on invalid input (fail-safe: TVL unavailable → no TVL adjustment).
+    Does NOT affect il_score / breach_risk / rebalance_cost (no double-counting).
+    """
+    if tvl_usd <= 0:
+        return 1.0   # fail-safe: treat missing TVL as neutral
+    # Only apply discount above TVL_REF; cap at 1.0 (no boost for small pools)
+    decades_above_ref = max(0.0, math.log10(tvl_usd / _TVL_REF))
+    factor = 1.0 - _TVL_DECAY * decades_above_ref
+    return max(_TVL_FLOOR, min(1.0, factor))
 
 
 # ── Analytical terminal OOR helpers (P2.2.3) ───────────────────────────────
@@ -358,12 +412,17 @@ def score_candidate(
     w = weights or DEFAULT_WEIGHTS
 
     fee_s = _fee_score(backtest, horizon_bars)
-    # P2.2.2: crowding discount — narrow ranges face more LP competition at the same tick band
+    # P2.2.2 Phase 1+2: combined crowding discount
+    #   width_factor — tick-band congestion from range narrowness (Phase 1)
+    #   tvl_factor   — pool-level LP density from TVL size (Phase 2)
     crowding = _fee_capture_efficiency(candidate.width_pct)
+    tvl_factor = _tvl_crowding_factor(tvl_usd)
+    crowding *= tvl_factor
     fee_s = round(fee_s * crowding, 4)
     logger.debug(
-        "scorer: pool crowding width_pct=%.4f crowding=%.3f fee_s=%.4f",
-        candidate.width_pct, crowding, fee_s,
+        "scorer: crowding width_pct=%.4f width_factor=%.3f tvl_usd=%.0f tvl_factor=%.3f combined=%.3f fee_s=%.4f",
+        candidate.width_pct, _fee_capture_efficiency(candidate.width_pct),
+        tvl_usd, tvl_factor, crowding, fee_s,
     )
     il_s = _il_score(backtest, il_result)
     breach_r = _breach_risk(

@@ -2249,6 +2249,128 @@ def test_crowding_factor() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# G. P2.2.2 Phase 2 — TVL-adjusted crowding factor
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_tvl_crowding_factor() -> None:
+    section("G. P2.2.2 Phase 2 — TVL-adjusted crowding factor")
+
+    from app.models.schemas import (
+        BacktestResult, CandidateRange, ILRiskResult,
+        MarketQualityResult, RegimeResult,
+    )
+    from app.services.range_scorer import (
+        _tvl_crowding_factor,
+        _fee_capture_efficiency,
+        score_candidate,
+    )
+
+    il = ILRiskResult(level="medium", score=40, main_driver="vol")
+    quality = MarketQualityResult(
+        pool_address="0xTEST", wash_risk="low", wash_score=0.1,
+        vol_tvl_ratio=0.1, imbalance_ratio=0.5, avg_trade_size_usd=500.0,
+    )
+    regime = RegimeResult(
+        regime="range_bound", confidence=0.75,
+        realized_vol=0.60, drift_slope=0.0, jump_ratio=0.05,
+    )
+
+    def _bt():
+        return BacktestResult(
+            in_range_time_ratio=0.80, cumulative_fee_proxy=0.05,
+            il_cost_proxy=-0.02, first_breach_bar=30,
+            breach_count=1, rebalance_count=0, realized_net_pnl_proxy=0.03,
+        )
+
+    def _cand(width_pct: float) -> CandidateRange:
+        c = 100.0; h = c * width_pct / 2.0
+        return CandidateRange(
+            lower_price=c - h, upper_price=c + h,
+            lower_tick=int(-h * 10), upper_tick=int(h * 10),
+            width_pct=width_pct, center_price=c, range_type="volatility_band",
+        )
+
+    # ── TVL factor anchor points ──────────────────────────────────────────────
+    check(_tvl_crowding_factor(0) == 1.0,        "TVL=0 → fail-safe 1.0")
+    check(_tvl_crowding_factor(-500) == 1.0,     "TVL<0 → fail-safe 1.0")
+    check(_tvl_crowding_factor(100_000) == 1.0,  "TVL=$100K (< $1M ref) → 1.0")
+    check(_tvl_crowding_factor(1_000_000) == 1.0, "TVL=$1M (at ref) → 1.0")
+
+    f_10m  = _tvl_crowding_factor(10_000_000)
+    f_100m = _tvl_crowding_factor(100_000_000)
+    f_1b   = _tvl_crowding_factor(1_000_000_000)
+    f_10b  = _tvl_crowding_factor(10_000_000_000)
+
+    check(abs(f_10m  - 0.95) < 1e-9,  "TVL=$10M  → 0.95", f"got {f_10m:.4f}")
+    check(abs(f_100m - 0.90) < 1e-9,  "TVL=$100M → 0.90", f"got {f_100m:.4f}")
+    check(abs(f_1b   - 0.85) < 1e-9,  "TVL=$1B   → 0.85 (floor)", f"got {f_1b:.4f}")
+    check(f_10b == 0.85,               "TVL=$10B  → 0.85 (floor enforced)", f"got {f_10b:.4f}")
+
+    # Upper cap: small pools must NOT get a boost above 1.0
+    check(_tvl_crowding_factor(500_000) <= 1.0, "TVL=$500K ≤ 1.0 (no boost)")
+
+    # ── Monotonicity: larger TVL → smaller factor ─────────────────────────────
+    tvls = [1_000_000, 5_000_000, 10_000_000, 50_000_000, 100_000_000]
+    factors = [_tvl_crowding_factor(t) for t in tvls]
+    check(all(factors[i] >= factors[i+1] for i in range(len(factors)-1)),
+          "TVL factor is monotonically non-increasing",
+          f"{[round(f, 3) for f in factors]}")
+
+    # ── Combined factor table: width × TVL (4 × 3 grid) ──────────────────────
+    # Expected combined = width_factor × tvl_factor
+    # widths  : 0.02, 0.10, 0.30
+    # TVL USD : 100K, 1M, 10M, 100M
+    widths = [0.02, 0.10, 0.30]
+    tvl_cases = [
+        (100_000,     1.00),
+        (1_000_000,   1.00),
+        (10_000_000,  0.95),
+        (100_000_000, 0.90),
+    ]
+
+    for w in widths:
+        wf = _fee_capture_efficiency(w)
+        for tvl_usd, expected_tf in tvl_cases:
+            expected_combined = wf * expected_tf
+            actual_tf = _tvl_crowding_factor(tvl_usd)
+            actual_combined = wf * actual_tf
+            check(
+                abs(actual_combined - expected_combined) < 1e-9,
+                f"Grid w={w:.2f} TVL=${tvl_usd/1e6:.1f}M: "
+                f"wf({wf:.4f})×tf({actual_tf:.2f})={actual_combined:.4f}",
+            )
+
+    # ── Combined is strictly less than width-only when TVL > $1M ─────────────
+    for w in [0.02, 0.10, 0.30]:
+        wf_only     = _fee_capture_efficiency(w)
+        wf_plus_tvl = _fee_capture_efficiency(w) * _tvl_crowding_factor(100_000_000)
+        check(wf_plus_tvl < wf_only,
+              f"Phase2 reduces combined below Phase1 at TVL=$100M, width={w:.2f}",
+              f"{wf_plus_tvl:.4f} < {wf_only:.4f}")
+
+    # ── score_candidate integration: TVL wired through correctly ─────────────
+    s_small = score_candidate(
+        _cand(0.10), _bt(), il, quality, regime,
+        tvl_usd=500_000, horizon_bars=48,
+    )
+    s_large = score_candidate(
+        _cand(0.10), _bt(), il, quality, regime,
+        tvl_usd=100_000_000, horizon_bars=48,
+    )
+    check(s_large.fee_score < s_small.fee_score,
+          "fee_score: $100M pool < $500K pool (TVL discount applied)",
+          f"small={s_small.fee_score:.4f} large={s_large.fee_score:.4f}")
+
+    # IL, breach, rebalance_cost unaffected by TVL crowding change
+    check(s_large.il_score == s_small.il_score,
+          "il_score unchanged by TVL crowding factor",
+          f"small={s_small.il_score:.4f} large={s_large.il_score:.4f}")
+    check(s_large.breach_risk == s_small.breach_risk,
+          "breach_risk unchanged by TVL crowding factor",
+          f"small={s_small.breach_risk:.4f} large={s_large.breach_risk:.4f}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2298,8 +2420,11 @@ async def main() -> None:
     # ── E. P2.3.2 CEX/DEX divergence signal ──────────────────────────────────
     await test_cex_dex_divergence()
 
-    # ── F. P2.2.2 Crowding factor ─────────────────────────────────────────────
+    # ── F. P2.2.2 Crowding factor (Phase 1) ──────────────────────────────────
     test_crowding_factor()
+
+    # ── G. P2.2.2 Phase 2 TVL-adjusted crowding ───────────────────────────────
+    test_tvl_crowding_factor()
 
     # ── Summary ───────────────────────────────────────────────────────────────
     elapsed = time.time() - t0
