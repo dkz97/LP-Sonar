@@ -99,6 +99,10 @@ export interface LPOpportunity {
   main_risks: string[];
   confidence: number;
   timestamp: number;
+  // Phase 2 range signals — only present when a cached recommendation exists for this pool.
+  // Read from Redis lp_range cache; never triggers recomputation.
+  range_confidence?: number | null;  // recommendation_confidence from range engine (0–1)
+  range_regime?: string | null;      // regime from range engine: range_bound | trend_up | trend_down | chaotic
 }
 
 // ── Range Recommendation types ─────────────────────────────────────────────────

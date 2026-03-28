@@ -70,7 +70,22 @@ async def get_lp_opportunities(
             except Exception:
                 continue
 
-    # Sort globally by net_lp_score desc
+    # Enrich with Phase 2 signals from cached range recommendations.
+    # Read-only Redis GET — never triggers a new recommendation.
+    # Cache miss → fields stay absent (None). Fail-safe per item.
+    for item in results:
+        try:
+            rk = f"lp_range:{item['chain_index']}:{item['pool_address']}"
+            raw = await redis.get(rk)
+            if raw:
+                cached = json.loads(raw)
+                if cached.get("is_recommended"):
+                    item["range_confidence"] = cached.get("recommendation_confidence")
+                    item["range_regime"]     = cached.get("regime")
+        except Exception:
+            pass
+
+    # Sort globally by net_lp_score desc (unchanged)
     results.sort(key=lambda x: x["net_lp_score"], reverse=True)
     return results[:limit]
 

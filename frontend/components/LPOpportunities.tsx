@@ -236,9 +236,18 @@ export function LPOpportunities({ selectedChain, onViewToken }: Props) {
                       <RiskCell il={o.il_risk_level} wash={o.wash_risk} />
                     </td>
 
-                    {/* Confidence */}
-                    <td style={{ padding: "8px 10px", textAlign: "right", borderBottom: isExpanded ? "none" : "1px solid rgba(6,182,212,0.1)", fontFamily: "var(--font-mono)", fontSize: "11px", color: "var(--text-muted)" }}>
-                      {(o.confidence * 100).toFixed(0)}%
+                    {/* Confidence: Phase 1 LP decision confidence; Phase 2 range confidence below when cached */}
+                    <td style={{ padding: "8px 10px", textAlign: "right", borderBottom: isExpanded ? "none" : "1px solid rgba(6,182,212,0.1)" }}>
+                      <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: "2px" }}>
+                        <span style={{ fontFamily: "var(--font-mono)", fontSize: "11px", color: "var(--text-muted)" }}>
+                          {(o.confidence * 100).toFixed(0)}%
+                        </span>
+                        {o.range_confidence != null && (
+                          <span style={{ fontFamily: "var(--font-mono)", fontSize: "10px", fontWeight: 700, color: "#06b6d4" }}>
+                            P2·{(o.range_confidence * 100).toFixed(0)}%
+                          </span>
+                        )}
+                      </div>
                     </td>
                   </tr>
 
@@ -272,6 +281,27 @@ export function LPOpportunities({ selectedChain, onViewToken }: Props) {
                             }
                           </div>
                         </div>
+                        {/* Phase 2 regime badge — only shown when cached recommendation exists */}
+                        {o.range_regime && (
+                          <div style={{ marginTop: "8px", display: "flex", alignItems: "center", gap: "6px" }}>
+                            <span style={{ fontSize: "10px", color: "var(--text-muted)", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em" }}>Range analysis:</span>
+                            <span style={{
+                              fontSize: "10px", fontFamily: "var(--font-mono)", fontWeight: 700,
+                              color: o.range_regime === "range_bound" ? "#22c55e" : o.range_regime === "chaotic" ? "#ef4444" : "#eab308",
+                              background: o.range_regime === "range_bound" ? "rgba(34,197,94,0.08)" : o.range_regime === "chaotic" ? "rgba(239,68,68,0.08)" : "rgba(234,179,8,0.08)",
+                              border: `1px solid ${o.range_regime === "range_bound" ? "rgba(34,197,94,0.3)" : o.range_regime === "chaotic" ? "rgba(239,68,68,0.3)" : "rgba(234,179,8,0.3)"}`,
+                              borderRadius: "4px", padding: "1px 6px",
+                            }}>
+                              {o.range_regime.replace("_", " ")}
+                            </span>
+                            {o.range_confidence != null && (
+                              <span style={{ fontSize: "10px", color: "#06b6d4", fontFamily: "var(--font-mono)", fontWeight: 600 }}>
+                                conf {(o.range_confidence * 100).toFixed(0)}%
+                              </span>
+                            )}
+                          </div>
+                        )}
+
                         {/* View token link */}
                         {onViewToken && (
                           <button
