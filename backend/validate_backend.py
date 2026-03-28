@@ -2371,6 +2371,131 @@ def test_tvl_crowding_factor() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# H. P2.3.3 — Competitive fee capture ratio
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_competitive_capture_ratio() -> None:
+    section("H. P2.3.3 — Competitive fee capture ratio (vol/TVL)")
+
+    from app.models.schemas import (
+        BacktestResult, CandidateRange, ILRiskResult,
+        MarketQualityResult, RegimeResult,
+    )
+    from app.services.range_scorer import (
+        _competitive_capture_ratio,
+        _fee_capture_efficiency,
+        _tvl_crowding_factor,
+        score_candidate,
+    )
+
+    il = ILRiskResult(level="medium", score=40, main_driver="vol")
+    regime = RegimeResult(
+        regime="range_bound", confidence=0.75,
+        realized_vol=0.60, drift_slope=0.0, jump_ratio=0.05,
+    )
+
+    def _quality(vol_tvl: float) -> MarketQualityResult:
+        return MarketQualityResult(
+            pool_address="0xTEST", wash_risk="low", wash_score=0.1,
+            vol_tvl_ratio=vol_tvl, imbalance_ratio=0.5, avg_trade_size_usd=500.0,
+        )
+
+    def _bt():
+        return BacktestResult(
+            in_range_time_ratio=0.80, cumulative_fee_proxy=0.05,
+            il_cost_proxy=-0.02, first_breach_bar=30,
+            breach_count=1, rebalance_count=0, realized_net_pnl_proxy=0.03,
+        )
+
+    def _cand(width_pct: float) -> CandidateRange:
+        c = 100.0; h = c * width_pct / 2.0
+        return CandidateRange(
+            lower_price=c - h, upper_price=c + h,
+            lower_tick=int(-h * 10), upper_tick=int(h * 10),
+            width_pct=width_pct, center_price=c, range_type="volatility_band",
+        )
+
+    # ── Anchor points ─────────────────────────────────────────────────────────
+    check(_competitive_capture_ratio(0) == 1.0,   "vol_tvl=0 → fail-safe 1.0")
+    check(_competitive_capture_ratio(-1) == 1.0,  "vol_tvl<0 → fail-safe 1.0")
+    check(_competitive_capture_ratio(0.1) > 0.90, "vol_tvl=0.1 (quiet) → > 0.90")
+
+    mid = _competitive_capture_ratio(1.0)
+    check(0.80 < mid < 0.90,
+          "vol_tvl=1.0 (neutral) → sigmoid midpoint 0.80–0.90", f"got={mid:.4f}")
+
+    floor_val = _competitive_capture_ratio(5.0)
+    check(floor_val >= 0.70, "vol_tvl=5.0 → floor 0.70 enforced", f"got={floor_val:.4f}")
+    check(floor_val < 0.75,  "vol_tvl=5.0 → near floor (<0.75)",   f"got={floor_val:.4f}")
+
+    # ── Monotonicity ──────────────────────────────────────────────────────────
+    vol_tvls = [0.0, 0.1, 0.5, 1.0, 2.0, 3.0, 5.0]
+    captures = [_competitive_capture_ratio(v) for v in vol_tvls]
+    check(all(captures[i] >= captures[i + 1] for i in range(len(captures) - 1)),
+          "Capture ratio monotonically non-increasing with vol/TVL",
+          " ".join(f"{c:.3f}" for c in captures))
+
+    # ── Independence from P2.2.2 (same width + TVL, different vol/TVL) ───────
+    WIDTH, TVL = 0.10, 10_000_000
+    s_quiet = score_candidate(_cand(WIDTH), _bt(), il, _quality(0.1), regime,
+                              tvl_usd=TVL, horizon_bars=48)
+    s_hot   = score_candidate(_cand(WIDTH), _bt(), il, _quality(3.0), regime,
+                              tvl_usd=TVL, horizon_bars=48)
+    check(s_hot.fee_score < s_quiet.fee_score,
+          "Independence: same width+TVL, hot pool fee_score < quiet pool",
+          f"quiet={s_quiet.fee_score:.4f} hot={s_hot.fee_score:.4f}")
+
+    # Prove it's not crowding: crowding is identical for both pools
+    wf = _fee_capture_efficiency(WIDTH)
+    tf = _tvl_crowding_factor(TVL)
+    c_quiet = _competitive_capture_ratio(0.1)
+    c_hot   = _competitive_capture_ratio(3.0)
+    check(abs(wf * tf - wf * tf) < 1e-12,
+          f"Crowding identical for quiet/hot pools: wf={wf:.3f} tf={tf:.2f}")
+    check(c_quiet > c_hot,
+          "P2.3.3 differs: quiet capture > hot capture (crowding alone invariant)",
+          f"quiet_cap={c_quiet:.3f} hot_cap={c_hot:.3f}")
+
+    # ── Aggressive vs conservative: width amplifies capture difference ────────
+    s_agg  = score_candidate(_cand(0.02), _bt(), il, _quality(2.0), regime,
+                             tvl_usd=5_000_000, horizon_bars=48)
+    s_cons = score_candidate(_cand(0.30), _bt(), il, _quality(2.0), regime,
+                             tvl_usd=5_000_000, horizon_bars=48)
+    check(s_agg.fee_score < s_cons.fee_score,
+          "Under competition, aggressive fee_score < conservative",
+          f"agg={s_agg.fee_score:.4f} cons={s_cons.fee_score:.4f}")
+
+    # ── No interference with IL / breach ──────────────────────────────────────
+    check(s_quiet.il_score == s_hot.il_score,
+          "il_score unchanged by competitive capture",
+          f"quiet={s_quiet.il_score:.4f} hot={s_hot.il_score:.4f}")
+    check(s_quiet.breach_risk == s_hot.breach_risk,
+          "breach_risk unchanged by competitive capture",
+          f"quiet={s_quiet.breach_risk:.4f} hot={s_hot.breach_risk:.4f}")
+
+    # ── System stability: utility never collapses ─────────────────────────────
+    for vt, label in [(0.05, "very_quiet"), (1.0, "medium"), (5.0, "very_hot")]:
+        s = score_candidate(_cand(0.10), _bt(), il, _quality(vt), regime,
+                            tvl_usd=5_000_000, horizon_bars=48)
+        check(s.utility_score >= 0.0,
+              f"No collapse: vol_tvl={vt} ({label}) utility >= 0",
+              f"utility={s.utility_score:.4f}")
+
+    # ── Combined haircut table: width × vol/TVL (3×3, TVL=$5M fixed) ─────────
+    print("\n    Combined fee haircut table  [TVL=$5M, wf × tvl_f × capture]:")
+    print(f"    {'':12} {'vol/TVL=0.1':>14} {'vol/TVL=1.0':>14} {'vol/TVL=3.0':>14}")
+    tf5m = _tvl_crowding_factor(5_000_000)
+    for w, wlabel in [(0.02, "width=0.02"), (0.10, "width=0.10"), (0.30, "width=0.30")]:
+        wf = _fee_capture_efficiency(w)
+        row = f"    {wlabel:12}"
+        for vt in [0.1, 1.0, 3.0]:
+            cf = _competitive_capture_ratio(vt)
+            combined = wf * tf5m * cf
+            row += f"       {combined:.3f}    "
+        print(row)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2425,6 +2550,9 @@ async def main() -> None:
 
     # ── G. P2.2.2 Phase 2 TVL-adjusted crowding ───────────────────────────────
     test_tvl_crowding_factor()
+
+    # ── H. P2.3.3 Competitive fee capture ratio ────────────────────────────────
+    test_competitive_capture_ratio()
 
     # ── Summary ───────────────────────────────────────────────────────────────
     elapsed = time.time() - t0

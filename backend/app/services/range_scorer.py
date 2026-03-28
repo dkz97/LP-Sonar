@@ -1,7 +1,7 @@
 """
 Range Scorer: computes utility score for each candidate range.
 
-Score(r) = w_fee * FeeScore(r) * crowding_factor(width)
+Score(r) = w_fee * FeeScore(r) * crowding_factor(width, tvl) * capture_ratio(vol_tvl)
          - w_il  * ILScore(r)
          - w_breach * BreachRisk(r)
          - w_rebalance * RebalanceCost(r)
@@ -17,11 +17,22 @@ Default weights (configurable via config.py):
   rebalance 0.10
   quality   0.10
 
-P2.2.2 — Crowding factor (fee capture haircut):
-  Concentrated ranges compete with other LPs at the same tick band.
-  Narrower ranges = more crowded = lower fraction of theoretical fee captured.
-  crowding_factor ∈ [_CROWDING_FLOOR, 1.0] applied to fee_score only.
-  Does NOT affect il_score / breach_risk / rebalance_cost (no double-counting).
+P2.2.2 — Crowding factor (structural density):
+  Two independent structural dimensions reduce theoretical fee capture:
+    Phase 1 (width):  narrower range → more crowded tick band
+    Phase 2 (TVL):    larger pool → more LP capital competing
+  crowding_factor ∈ [_CROWDING_FLOOR × _TVL_FLOOR, 1.0]
+
+P2.3.3 — Competitive fee capture ratio (activity-driven competition):
+  High-activity pools (vol/TVL >> 1) attract sophisticated automated LPs
+  who concentrate in very narrow ranges, diluting individual LP's realized share.
+  Proxy: vol_tvl_ratio (daily volume / TVL) from MarketQualityResult.
+  capture_ratio ∈ [_CAPTURE_FLOOR, 1.0]; orthogonal to P2.2.2 crowding.
+
+  Semantic boundary:
+    crowding_factor  — structural: how many LPs (width + TVL)
+    capture_ratio    — dynamic: how contested the fee flow is (vol/TVL)
+  Same width + same TVL → same crowding; different vol/TVL → different capture.
 """
 from __future__ import annotations
 import logging
@@ -99,6 +110,31 @@ _TVL_REF   = 1_000_000.0   # $1M — neutral TVL, factor = 1.0
 _TVL_DECAY = 0.05           # per-decade discount above TVL_REF
 _TVL_FLOOR = 0.85           # minimum TVL factor (even for $1B+ pools)
 
+# ── P2.3.3: Competitive fee capture constants ─────────────────────────────────
+# High-activity pools attract automated LPs / market-makers with very tight ranges
+# who capture a disproportionate share of fees.  vol/TVL is a proxy for how
+# "contested" the fee flow is.  Result: individual LP realized share < theoretical.
+#
+# Formula:
+#   capture_ratio = FLOOR + (1-FLOOR) × (1 - σ(STEEPNESS × (vol_tvl - NEUTRAL)))
+#
+# vol/TVL anchors (daily_volume / tvl_usd):
+#   0.0  → 1.00 (fail-safe; treat missing as quiet pool)
+#   0.1  → 0.94 ( 6% haircut — quiet pool, passive LP only)
+#   0.5  → 0.90 (10% haircut — lightly active)
+#   1.0  → 0.85 (15% haircut — neutral midpoint)
+#   2.0  → 0.76 (24% haircut — hot pool, active competition)
+#   3.0  → 0.71 (29% haircut — very hot, near floor)
+#   5.0+ → 0.70 (floor enforced)
+#
+# Orthogonality: same width + same TVL → crowding_factor identical for two pools;
+# different vol/TVL → capture_ratio differs → separation is provable by construction.
+#
+# Combined floor: 0.50 (width) × 0.85 (TVL) × 0.70 (capture) = 0.30 at extreme.
+_CAPTURE_FLOOR     = 0.70   # minimum individual capture ratio (hottest pools)
+_CAPTURE_NEUTRAL   = 1.0    # vol/TVL inflection point — midpoint of sigmoid
+_CAPTURE_STEEPNESS = 1.5    # steepness of sigmoid transition
+
 
 def _tvl_crowding_factor(tvl_usd: float) -> float:
     """
@@ -126,6 +162,42 @@ def _tvl_crowding_factor(tvl_usd: float) -> float:
     decades_above_ref = max(0.0, math.log10(tvl_usd / _TVL_REF))
     factor = 1.0 - _TVL_DECAY * decades_above_ref
     return max(_TVL_FLOOR, min(1.0, factor))
+
+
+def _competitive_capture_ratio(vol_tvl_ratio: float) -> float:
+    """
+    Competitive fee capture ratio (P2.3.3).
+
+    High-activity pools attract automated market-makers and bots that concentrate
+    liquidity in extremely tight ranges, capturing a disproportionate share of fees.
+    This reduces the realistic fee capture of a normal LP below the width+TVL baseline.
+
+    Proxy: vol_tvl_ratio = 24h_volume / tvl_usd (from MarketQualityResult).
+
+    Formula:
+        capture = FLOOR + (1-FLOOR) × (1 - σ(STEEPNESS × (vol_tvl - NEUTRAL)))
+
+    Anchors:
+        vol_tvl ≤ 0  → 1.0  (fail-safe: treat as quiet pool)
+        vol_tvl = 0.1 → 0.94 (quiet pool, passive LPs)
+        vol_tvl = 1.0 → 0.85 (neutral midpoint, moderate competition)
+        vol_tvl = 3.0 → 0.71 (very hot pool, near floor)
+        vol_tvl = 5.0+ → 0.70 (floor enforced)
+
+    Orthogonal to P2.2.2:
+        crowding_factor = f(width, TVL)  — structural LP density
+        capture_ratio   = f(vol/TVL)     — activity-driven LP competition
+        Same width + same TVL → identical crowding; different vol/TVL → different capture.
+
+    Does NOT affect il_score / breach_risk / rebalance_cost.
+    """
+    if vol_tvl_ratio <= 0:
+        return 1.0   # fail-safe: missing or zero vol/TVL → no competitive adjustment
+    x = _CAPTURE_STEEPNESS * (vol_tvl_ratio - _CAPTURE_NEUTRAL)
+    x = max(-500.0, min(500.0, x))   # clamp against fp overflow
+    sigmoid = 1.0 / (1.0 + math.exp(-x))
+    # Inverted sigmoid: high vol_tvl → high sigmoid → low capture
+    return _CAPTURE_FLOOR + (1.0 - _CAPTURE_FLOOR) * (1.0 - sigmoid)
 
 
 # ── Analytical terminal OOR helpers (P2.2.3) ───────────────────────────────
@@ -411,18 +483,17 @@ def score_candidate(
     """
     w = weights or DEFAULT_WEIGHTS
 
-    fee_s = _fee_score(backtest, horizon_bars)
-    # P2.2.2 Phase 1+2: combined crowding discount
-    #   width_factor — tick-band congestion from range narrowness (Phase 1)
-    #   tvl_factor   — pool-level LP density from TVL size (Phase 2)
-    crowding = _fee_capture_efficiency(candidate.width_pct)
-    tvl_factor = _tvl_crowding_factor(tvl_usd)
-    crowding *= tvl_factor
-    fee_s = round(fee_s * crowding, 4)
+    fee_raw = _fee_score(backtest, horizon_bars)
+    # P2.2.2: structural crowding — width (Phase 1) × TVL (Phase 2)
+    width_factor = _fee_capture_efficiency(candidate.width_pct)
+    tvl_factor   = _tvl_crowding_factor(tvl_usd)
+    crowding     = width_factor * tvl_factor
+    # P2.3.3: competitive capture — vol/TVL activity-driven LP competition
+    capture      = _competitive_capture_ratio(quality_result.vol_tvl_ratio)
+    fee_s        = round(fee_raw * crowding * capture, 4)
     logger.debug(
-        "scorer: crowding width_pct=%.4f width_factor=%.3f tvl_usd=%.0f tvl_factor=%.3f combined=%.3f fee_s=%.4f",
-        candidate.width_pct, _fee_capture_efficiency(candidate.width_pct),
-        tvl_usd, tvl_factor, crowding, fee_s,
+        "scorer: fee_raw=%.4f width=%.3f tvl=%.3f crowding=%.3f capture=%.3f fee_s=%.4f",
+        fee_raw, width_factor, tvl_factor, crowding, capture, fee_s,
     )
     il_s = _il_score(backtest, il_result)
     breach_r = _breach_risk(
