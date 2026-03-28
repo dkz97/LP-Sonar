@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Backend Validation Script — LP Range Recommendation Engine Phase 1.5
+Backend Validation Script — LP Range Recommendation Engine Phase 1.5 / P2.3.2
 
 Sections:
   A. Pure-logic unit tests (no network)
   B. Integration tests via real API calls (DexScreener + OKX)
   C. Young-pool simulation (patched pool_state)
   D. Rejection cases
+  E. P2.3.2 CEX/DEX divergence signal
 
 Usage:
   cd /Users/zhangjiajun/LP-Sonar/backend
@@ -2035,6 +2036,95 @@ def test_calibration_json_load() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# E. P2.3.2 CEX/DEX Divergence Signal
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def test_cex_dex_divergence() -> None:
+    section("E. P2.3.2 CEX/DEX Divergence Signal")
+
+    from unittest.mock import AsyncMock
+    import dataclasses
+    from app.models.schemas import RegimeResult
+    from app.services.cex_price import (
+        map_dex_to_okx_symbol,
+        fetch_cex_spot_price,
+        apply_cex_regime_override,
+    )
+
+    baseline = RegimeResult(
+        regime="range_bound", confidence=0.75,
+        realized_vol=0.60, drift_slope=0.0001, jump_ratio=0.05,
+    )
+
+    # ── Symbol mapping ─────────────────────────────────────────────
+    check(map_dex_to_okx_symbol("WETH",  "USDC") == "ETH-USDT", "WETH/USDC → ETH-USDT")
+    check(map_dex_to_okx_symbol("WBTC",  "USDC") == "BTC-USDT", "WBTC/USDC → BTC-USDT")
+    check(map_dex_to_okx_symbol("SOL",   "USDC") == "SOL-USDT", "SOL/USDC  → SOL-USDT (passthrough)")
+    check(map_dex_to_okx_symbol("USDC",  "USDT") is None,        "USDC/USDT  → None (stable-stable skip)")
+    check(map_dex_to_okx_symbol("WMATIC","USDC") == "POL-USDT",  "WMATIC/USDC → POL-USDT (MATIC rename)")
+
+    # ── Case 1: divergence < 1% → regime unchanged ────────────────
+    dex_price = 1990.0
+    with patch("app.services.cex_price.fetch_cex_spot_price", new=AsyncMock(return_value=1993.0)):
+        r1 = await apply_cex_regime_override(
+            baseline, dex_price_usd=dex_price,
+            base_symbol="WETH", quote_symbol="USDC",
+        )
+    divergence_pct = abs(dex_price - 1993.0) / 1993.0 * 100
+    check(r1.regime == "range_bound",
+          "Case 1: divergence <1% → regime unchanged",
+          f"dex={dex_price} cex=1993 div={divergence_pct:.3f}%")
+    check(r1 == baseline, "Case 1: RegimeResult identical to input")
+
+    # ── Case 2: divergence > 1% → chaotic override ────────────────
+    dex_price2 = 1950.0   # ~2.2% below CEX
+    cex_price2  = 1993.0
+    with patch("app.services.cex_price.fetch_cex_spot_price", new=AsyncMock(return_value=cex_price2)):
+        r2 = await apply_cex_regime_override(
+            baseline, dex_price_usd=dex_price2,
+            base_symbol="WETH", quote_symbol="USDC",
+        )
+    divergence_pct2 = abs(dex_price2 - cex_price2) / cex_price2 * 100
+    check(r2.regime == "chaotic",
+          "Case 2: divergence >1% → regime overridden to chaotic",
+          f"dex={dex_price2} cex={cex_price2} div={divergence_pct2:.2f}%")
+    check(r2.confidence == baseline.confidence,   "Case 2: confidence field unchanged")
+    check(r2.realized_vol == baseline.realized_vol, "Case 2: realized_vol field unchanged")
+
+    # ── Case 3: CEX fetch fails → fail-open, regime unchanged ──────
+    with patch("app.services.cex_price.fetch_cex_spot_price", new=AsyncMock(return_value=None)):
+        r3 = await apply_cex_regime_override(
+            baseline, dex_price_usd=1990.0,
+            base_symbol="WETH", quote_symbol="USDC",
+        )
+    check(r3.regime == "range_bound", "Case 3: fetch=None → fail-open, regime unchanged")
+    check(r3 == baseline,             "Case 3: RegimeResult returned unchanged")
+
+    # ── Case 4: unmappable token → no fetch call ───────────────────
+    _calls: list = []
+    async def _spy(inst_id: str):
+        _calls.append(inst_id)
+        return 1.0
+    with patch("app.services.cex_price.fetch_cex_spot_price", new=_spy):
+        r4 = await apply_cex_regime_override(
+            baseline, dex_price_usd=1.0,
+            base_symbol="USDC", quote_symbol="USDT",
+        )
+    check(len(_calls) == 0,           "Case 4: stable-stable → fetch NOT called")
+    check(r4 == baseline,             "Case 4: regime unchanged for unmappable pair")
+
+    # ── Live smoke test (real OKX network) ────────────────────────
+    try:
+        live_price = await fetch_cex_spot_price("ETH-USDT")
+        check(live_price is not None and live_price > 100,
+              "Live: ETH-USDT price from OKX", f"last={live_price}")
+        none_price = await fetch_cex_spot_price("FAKECOIN-USDT")
+        check(none_price is None, "Live: unknown symbol returns None (fail-open)")
+    except Exception as e:
+        _warn("Live OKX smoke test skipped", str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2080,6 +2170,9 @@ async def main() -> None:
     # ── D. Rejection tests ────────────────────────────────────────────────────
     await test_rejection_low_tvl()
     await test_rejection_no_price_data()
+
+    # ── E. P2.3.2 CEX/DEX divergence signal ──────────────────────────────────
+    await test_cex_dex_divergence()
 
     # ── Summary ───────────────────────────────────────────────────────────────
     elapsed = time.time() - t0

@@ -57,6 +57,7 @@ from app.services.range_scorer import (
     select_profiles,
 )
 from app.services.regime_detector import detect_regime
+from app.services.cex_price import apply_cex_regime_override
 
 logger = logging.getLogger(__name__)
 
@@ -639,6 +640,14 @@ async def recommend_range(
 
     # ── 4. Layer B: Regime detection ─────────────────────────────────────
     regime_result = detect_regime(active_bars, bars_per_year=bars_per_year)
+
+    # P2.3.2: CEX/DEX divergence signal — silently no-ops on any failure
+    regime_result = await apply_cex_regime_override(
+        regime_result,
+        dex_price_usd=current_price,
+        base_symbol=pool["base_token_symbol"],
+        quote_symbol=pool["quote_token_symbol"],
+    )
 
     if regime_result.regime == "chaotic" and regime_result.confidence < 0.50:
         logger.info("range_recommender: chaotic market (low-confidence), using defensive ranges")
