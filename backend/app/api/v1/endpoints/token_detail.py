@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from math import floor
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.core.config import settings
 from app.core.redis_client import get_redis
@@ -1293,3 +1293,84 @@ async def get_tx_history(
 
     inflight_key = fresh_key if refresh == 0 else f"{fresh_key}:refresh"
     return await _run_gt_inflight(inflight_key, _fetch)
+
+
+@router.get("/{chain_index}/{address}/wash-analysis")
+async def get_wash_analysis_endpoint(
+    chain_index: str,
+    address: str,
+    pool_address: str = Query(None, description="Pool address for wash_score context"),
+    redis=Depends(get_redis),
+) -> dict:
+    """
+    Return Sniper-tagged wallet activity for a token.
+
+    Fetches OKX Sniper-tagged trades and aggregates per wallet.
+    Also surfaces the pool-level wash_score from the LP decision cache.
+    These are two independent signals — not a definitive wash-trading verdict.
+    Cached for 2 minutes.
+    """
+    from app.services.wash_analysis_service import get_wash_analysis
+
+    cache_key = f"wash_analysis:{chain_index}:{address}"
+    cached = await redis.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+    pool_wash_score = 0.0
+    pool_wash_risk = "low"
+    pool_volume_24h = 0.0
+
+    try:
+        if pool_address:
+            dec_key = f"lp_decision:{chain_index}:{pool_address}"
+        else:
+            primary_pool_raw = await redis.hget(f"snapshot:{chain_index}:{address}", "lp_pool_address")
+            primary_pool = (primary_pool_raw or b"").decode() if isinstance(primary_pool_raw, bytes) else (primary_pool_raw or "")
+            dec_key = f"lp_decision:{chain_index}:{primary_pool}"
+
+        dec_data = await redis.hgetall(dec_key)
+        if dec_data:
+            pool_wash_score = float(dec_data.get("market_quality_score") or 0)
+            pool_wash_risk  = (dec_data.get("wash_risk") or b"low")
+            if isinstance(pool_wash_risk, bytes):
+                pool_wash_risk = pool_wash_risk.decode()
+
+        # Real 24h volume from token snapshot (pair_snapshot has volume_24h for the pool)
+        _pool = pool_address or ""
+        if not _pool and dec_key:
+            _pool_raw = await redis.hget(f"snapshot:{chain_index}:{address}", "lp_pool_address")
+            _pool = (_pool_raw or b"").decode() if isinstance(_pool_raw, bytes) else (_pool_raw or "")
+        if _pool:
+            _snap_vol_raw = await redis.hget(f"pair_snapshot:{chain_index}:{_pool}", "volume_24h")
+            if _snap_vol_raw is None:
+                _snap_vol_raw = await redis.hget(f"snapshot:{chain_index}:{address}", "volume_24h")
+            if _snap_vol_raw is not None:
+                try:
+                    pool_volume_24h = float(_snap_vol_raw)
+                except (ValueError, TypeError):
+                    pass
+    except Exception:
+        pass
+
+    logger.info(
+        "wash-analysis chain=%s token=%.8s volume_24h_found=%s pool_volume=%.0f",
+        chain_index, address, pool_volume_24h > 0, pool_volume_24h,
+    )
+
+    result_obj = await get_wash_analysis(
+        chain_index=chain_index,
+        token_address=address,
+        pool_wash_score=pool_wash_score,
+        pool_wash_risk=pool_wash_risk,
+        pool_volume_24h=pool_volume_24h,
+    )
+    result = result_obj.model_dump()
+
+    logger.info(
+        "wash-analysis done chain=%s token=%.8s sniper_count=%d sniper_vol_pct=%.4f",
+        chain_index, address, result_obj.sniper_count, result_obj.sniper_volume_pct,
+    )
+
+    await redis.set(cache_key, json.dumps(result), ex=120)
+    return result

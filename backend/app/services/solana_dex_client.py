@@ -505,6 +505,59 @@ async def get_meteora_fee_rate(pool_address: str) -> float:
     return total_fee_pct / 100.0 if total_fee_pct > 0 else 0.0
 
 
+async def get_meteora_pool_positions(pool_address: str) -> list[dict]:
+    """
+    Fetch all active LP positions for a Meteora DLMM pool.
+
+    Endpoint: GET {meteora_api_url}/pair/{pool_address}/positions
+    Returns list of position dicts with keys:
+      position_address, owner, lower_bin_id, upper_bin_id, liquidity_shares,
+      fee_x, fee_y, total_fee_usd (if available)
+    Returns empty list on failure or if endpoint not available.
+    """
+    url = f"{settings.meteora_api_url}/pair/{pool_address}/positions"
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            resp = await client.get(url)
+            if resp.status_code == 404:
+                logger.debug("Meteora positions: pool not found pool=%.8s", pool_address)
+                return []
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        logger.debug("Meteora positions fetch failed pool=%.8s: %s", pool_address, e)
+        return []
+
+    rows: list = data if isinstance(data, list) else (data.get("positions") or data.get("data") or [])
+
+    results: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        owner = (
+            row.get("owner")
+            or row.get("wallet")
+            or row.get("user")
+            or (row.get("publicKey") or "")
+        )
+        if not owner:
+            continue
+        results.append({
+            "owner":          str(owner),
+            "tick_lower":     int(row.get("lower_bin_id") or row.get("lowerBinId") or 0),
+            "tick_upper":     int(row.get("upper_bin_id") or row.get("upperBinId") or 0),
+            "liquidity":      str(row.get("liquidity_shares") or row.get("liquidity") or 0),
+            "deposited_x":    _safe_float(row.get("total_x_amount") or row.get("depositedX")),
+            "deposited_y":    _safe_float(row.get("total_y_amount") or row.get("depositedY")),
+            "fee_x":          _safe_float(row.get("fee_x") or row.get("feeX")),
+            "fee_y":          _safe_float(row.get("fee_y") or row.get("feeY")),
+            "total_fee_usd":  _safe_float(row.get("total_fee_usd") or row.get("totalFeeUsd")),
+        })
+
+    logger.debug("Meteora positions pool=%.8s: %d found", pool_address, len(results))
+    return results
+
+
 async def get_orca_fee_rate(pool_address: str) -> float:
     """Fetch Orca whirlpool fee rate as decimal, or 0 on failure."""
     url = f"https://api.orca.so/v2/solana/pools/{pool_address}"

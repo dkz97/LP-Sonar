@@ -240,6 +240,62 @@ class RangeRecommendation(BaseModel):
     effective_position_usd: Optional[float] = None
 
 
+# ── LP Position Holders ───────────────────────────────────────────────────────
+
+@dataclass
+class LPPosition:
+    owner: str
+    tick_lower: int
+    tick_upper: int
+    price_lower: float          # converted from tick (token1/token0)
+    price_upper: float
+    liquidity: str              # raw uint128 string
+    deposited_token0: float
+    deposited_token1: float
+    fees_token0: float
+    fees_token1: float
+    fees_usd: float
+    current_value_usd: Optional[float]   # None if calc not possible
+    pnl_usd: Optional[float]             # fees + (current − deposited) mark-to-market
+    in_range: bool
+
+
+class PoolPositionSummary(BaseModel):
+    pool_address: str
+    chain_index: str
+    total_positions: int
+    active_positions: int        # in-range count
+    top10_liquidity_pct: float   # top-10 share of fetched positions' liquidity (not full pool)
+    positions_fetched: int       # how many positions were fetched (denominator for top10_liquidity_pct)
+    positions: list[dict]        # top 50 by liquidity
+    cached_at: int
+    unavailable_reason: str = ""  # non-empty when data couldn't be fetched
+
+
+# ── Suspicious Trader / Wash Analysis ────────────────────────────────────────
+
+@dataclass
+class SuspiciousTrader:
+    address: str
+    tag: str                    # "Sniper" / "SmartMoney"
+    trade_count: int
+    buy_volume_usd: float
+    sell_volume_usd: float
+    total_volume_usd: float
+    first_seen: int             # unix timestamp seconds
+    last_seen: int
+
+
+class WashAnalysis(BaseModel):
+    pool_wash_score: float      # from market_quality (existing signal)
+    pool_wash_risk: str         # "low" | "medium" | "high"
+    sniper_count: int           # distinct sniper wallets seen
+    sniper_volume_pct: float    # fraction of 24h vol from sniper tags (0–1)
+    suspicious_traders: list[dict]  # top 20 by total volume
+    analysis_window: str = "recent_100_trades"
+    cached_at: int
+
+
 @dataclass
 class LPDecision:
     chain_index: str

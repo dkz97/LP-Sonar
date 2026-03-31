@@ -325,6 +325,85 @@ async def fetch_v4_pool_state(chain_index: str, pool_id: str) -> dict | None:
     return state
 
 
+# ── Pool Positions (subgraph) ────────────────────────────────────────────────
+
+_GQL_POSITIONS_QUERY = """
+query PoolPositions($poolId: String!, $skip: Int!) {
+  pool(id: $poolId) {
+    sqrtPrice
+    tick
+    token0Price
+    token1Price
+    token0 { id symbol decimals }
+    token1 { id symbol decimals }
+    totalValueLockedToken0
+    totalValueLockedToken1
+    totalValueLockedUSD
+  }
+  positions(
+    where: { pool: $poolId, liquidity_gt: "0" }
+    first: 100
+    skip: $skip
+    orderBy: liquidity
+    orderDirection: desc
+  ) {
+    id
+    owner
+    tickLower { tickIdx }
+    tickUpper { tickIdx }
+    liquidity
+    depositedToken0
+    depositedToken1
+    withdrawnToken0
+    withdrawnToken1
+    collectedFeesToken0
+    collectedFeesToken1
+  }
+}
+"""
+
+
+async def get_v4_pool_positions(
+    chain_index: str,
+    pool_id: str,
+    skip: int = 0,
+) -> dict | None:
+    """
+    Query V4 subgraph for positions in a pool.
+
+    Returns dict with keys: pool (pool metadata), positions (list).
+    Returns None if subgraph not configured or query fails.
+    """
+    cfg = _V4_CHAIN_CONFIG.get(chain_index)
+    if not cfg:
+        return None
+
+    subgraph_url = getattr(settings, cfg["subgraph_url_attr"], "")
+    if not subgraph_url:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                subgraph_url,
+                json={
+                    "query": _GQL_POSITIONS_QUERY,
+                    "variables": {"poolId": pool_id.lower(), "skip": skip},
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        logger.warning("V4 positions query failed pool=%.10s: %s", pool_id, exc)
+        return None
+
+    gql_data = data.get("data") or {}
+    return {
+        "pool":      gql_data.get("pool"),
+        "positions": gql_data.get("positions") or [],
+    }
+
+
 # ── Helper ───────────────────────────────────────────────────────────────────
 
 def _classify_quote(symbol: str) -> str:

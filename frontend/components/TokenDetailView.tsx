@@ -6,6 +6,7 @@ import {
 } from "recharts";
 import { ExternalLink, Copy, Check, RefreshCw } from "lucide-react";
 import { chainName, explorerUrl, formatVolume, formatPrice, TokenSnapshot } from "@/lib/api";
+import { LPHolders } from "@/components/LPHolders";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -654,6 +655,15 @@ export function TokenDetailView({ chainIndex, address, snapshot }: TokenDetailVi
           </div>
         </div>
       </div>
+
+      {/* ── LP Holders + Wash Analysis ── */}
+      {selectedPool && (
+        <LPHolders
+          chainIndex={chainIndex}
+          poolAddress={selectedPool.pool_address}
+          tokenAddress={address}
+        />
+      )}
 
       <style>{`
         @keyframes spin { to { transform: rotate(360deg); } }

@@ -206,6 +206,60 @@ export interface RangeRecommendation {
   effective_position_usd?: number | null;
 }
 
+// ── LP Position Holders ────────────────────────────────────────────────────────
+
+export interface LPPosition {
+  owner: string;
+  tick_lower: number;
+  tick_upper: number;
+  price_lower: number;
+  price_upper: number;
+  liquidity: string;
+  deposited_token0: number;
+  deposited_token1: number;
+  fees_token0: number;
+  fees_token1: number;
+  fees_usd: number;
+  current_value_usd: number | null;
+  pnl_usd: number | null;
+  in_range: boolean;
+}
+
+export interface PoolPositionSummary {
+  pool_address: string;
+  chain_index: string;
+  total_positions: number;
+  active_positions: number;
+  top10_liquidity_pct: number;   // top-10 share of fetched positions only
+  positions_fetched: number;     // denominator for top10_liquidity_pct
+  positions: LPPosition[];
+  cached_at: number;
+  unavailable_reason: string;
+}
+
+// ── Suspicious Trader / Wash Analysis ─────────────────────────────────────────
+
+export interface SuspiciousTrader {
+  address: string;
+  tag: string;
+  trade_count: number;
+  buy_volume_usd: number;
+  sell_volume_usd: number;
+  total_volume_usd: number;
+  first_seen: number;
+  last_seen: number;
+}
+
+export interface WashAnalysis {
+  pool_wash_score: number;       // 0–1, from existing market_quality
+  pool_wash_risk: WashRisk;
+  sniper_count: number;
+  sniper_volume_pct: number;     // 0–1
+  suspicious_traders: SuspiciousTrader[];
+  analysis_window: string;
+  cached_at: number;
+}
+
 // ── Fetch functions ────────────────────────────────────────────────────────────
 
 export async function fetchTokens(
@@ -265,6 +319,32 @@ export async function fetchLPRangeRecommendation(
 
 export async function fetchHealth(): Promise<{ status: string }> {
   const res = await fetch(`${API_BASE}/health`);
+  return res.json();
+}
+
+export async function fetchPoolPositions(
+  chainIndex: string,
+  poolAddress: string,
+): Promise<PoolPositionSummary> {
+  const res = await fetch(
+    `${API_BASE}/api/v1/pool/${chainIndex}/${poolAddress}/positions`,
+    { next: { revalidate: 0 } },
+  );
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function fetchWashAnalysis(
+  chainIndex: string,
+  tokenAddress: string,
+  poolAddress?: string,
+): Promise<WashAnalysis> {
+  const params = poolAddress ? `?pool_address=${poolAddress}` : "";
+  const res = await fetch(
+    `${API_BASE}/api/v1/token/${chainIndex}/${tokenAddress}/wash-analysis${params}`,
+    { next: { revalidate: 0 } },
+  );
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
 

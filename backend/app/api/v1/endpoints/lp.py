@@ -6,6 +6,7 @@ from redis.asyncio import Redis
 
 from app.core.config import settings
 from app.core.redis_client import get_redis
+from app.services.lp_positions_service import get_pool_positions
 
 router = APIRouter()
 
@@ -88,6 +89,34 @@ async def get_lp_opportunities(
     # Sort globally by net_lp_score desc (unchanged)
     results.sort(key=lambda x: x["net_lp_score"], reverse=True)
     return results[:limit]
+
+
+@router.get("/pool/{chain_index}/{pool_address}/positions")
+async def get_pool_positions_endpoint(
+    chain_index: str,
+    pool_address: str,
+    redis: Redis = Depends(get_redis),
+) -> dict:
+    """
+    Return LP position holders for a pool.
+
+    Sources:
+      - BSC (V4):           Uniswap V4 subgraph
+      - ETH/Base/Polygon:   Uniswap V3 subgraph (requires subgraph URL configured)
+      - Solana:             Meteora DLMM positions API
+
+    Cached in Redis for 3 minutes.
+    """
+    cache_key = f"lp_positions:{chain_index}:{pool_address}"
+    cached = await redis.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+    summary = await get_pool_positions(chain_index, pool_address)
+    result = summary.model_dump()
+
+    await redis.set(cache_key, json.dumps(result), ex=180)
+    return result
 
 
 @router.get("/lp-decision/{chain_index}/{pool_address}")

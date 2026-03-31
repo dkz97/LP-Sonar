@@ -177,6 +177,22 @@ async def get_recent_trades(
     return result if isinstance(result, list) else []
 
 
+async def get_sniper_traders(
+    chain_index: str,
+    token_address: str,
+    limit: int = 100,
+) -> list[dict]:
+    """
+    Fetch recent trades tagged as 'Sniper' for a token.
+
+    Returns the raw trade list — each item may contain a trader/wallet address
+    field (field name varies by OKX API version; try traderAddress, walletAddress,
+    address, maker).  Always includes: type ("buy"/"sell"), volume (USD), time (ms).
+    """
+    # OKX tagFilter is numeric: 7=Sniper, 3=SmartMoney, 4=Whale, 6=Suspicious
+    return await get_recent_trades(chain_index, token_address, limit=limit, tag_filter="7")
+
+
 async def get_meme_token_list(
     chain_index: str,
     min_market_cap_usd: str | None = None,
